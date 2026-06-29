@@ -1,0 +1,9 @@
+# Compiled test binary
+/mctp_aardvark_test
+
+# Convenience symlink to the vendored Aardvark shared library
+/aardvark.so
+
+# Object / build artifacts
+*.o
+*.obj
