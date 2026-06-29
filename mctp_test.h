@@ -35,20 +35,11 @@
 #define MCTP_FLAG_TO  0x08
 
 // ---- PLDM (DSP0240) over MCTP (message type 0x01) ----
+// Only the transport-level constants live here (used by rx_all in
+// mctp_aardvark_test.c). All PLDM command/type/completion codes come from
+// libpldm (pldm_test.c), to avoid clashing with libpldm's own definitions.
 #define MCTP_MSG_TYPE_PLDM 0x01
 #define PLDM_RQ		   0x80 // request bit in PLDM hdr byte 0
-// PLDM Base / Control & Discovery (PLDM type 0x00) command codes
-#define PLDM_BASE	      0x00
-#define PLDM_CMD_SET_TID      0x01
-#define PLDM_CMD_GET_TID      0x02
-#define PLDM_CMD_GET_VERSION  0x03
-#define PLDM_CMD_GET_TYPES    0x04
-#define PLDM_CMD_GET_COMMANDS 0x05
-// PLDM completion codes
-#define PLDM_CC_SUCCESS		   0x00
-#define PLDM_CC_ERROR_UNSUPPORTED  0x05
-#define PLDM_CC_ERROR_INVALID_TYPE 0x20
-#define PLDM_OUR_TID		   0x01 // our terminus id when acting as a device
 
 struct app_ctx {
 	Aardvark aa;

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // PLDM (DSP0240) test bench over MCTP-over-I2C, built on the shared transport
-// core in mctp_test.h. Like OpenBMC's pldmd, our endpoint plays both roles:
+// core in mctp_test.h. PLDM messages are encoded/decoded with OpenBMC's
+// libpldm (the same library OpenBMC's pldmd uses) — only the encode/decode
+// library, not the daemon.
 //
-//   requester  -- query the DUT's PLDM terminus (GetTID, GetPLDMTypes, and for
-//                 each supported type GetPLDMVersion + GetPLDMCommands) and
-//                 validate the responses. We ask the DUT what it supports first.
-//
-//   responder  -- our side answers PLDM Base requests like a PLDM device.
-//                 Validated by injecting requests and capturing our responses
-//                 (libmctp does not implement a PLDM responder, so we do).
+//   requester  -- query the DUT's PLDM terminus (Base discovery + FRU) using
+//                 libpldm encode/decode, and validate the responses.
+//   responder  -- our side answers PLDM Base requests like a PLDM device,
+//                 validated by injecting requests and capturing our responses.
 
 #include <stdint.h>
 #include <stdio.h>
@@ -17,30 +16,52 @@
 
 #include "mctp_test.h"
 
-// CRC-32 (IEEE 802.3, reflected) — used in GetPLDMVersion responses.
-static uint32_t crc32_ieee(const uint8_t *p, size_t len)
+#include <libpldm/base.h>
+#include <libpldm/fru.h>
+#include <libpldm/pldm_types.h>
+
+#define PLDM_OUR_TID 0x01 // our terminus id when acting as a device
+
+// A PLDM message on the wire = MCTP type byte (0x01) + struct pldm_msg
+// (3-byte header + payload). libpldm encodes into a struct pldm_msg, so we
+// place it at offset 1 and prepend the MCTP type byte ourselves.
+#define PLDM_HDR_SZ (sizeof(struct pldm_msg_hdr))
+#define MCTP_PLDM_OVERHEAD (1 + PLDM_HDR_SZ) // MCTP byte + PLDM header
+
+static uint8_t pl_iid(struct app_ctx *ctx)
 {
-	uint32_t c = 0xffffffff;
-	for (size_t i = 0; i < len; i++) {
-		c ^= p[i];
-		for (int k = 0; k < 8; k++)
-			c = (c & 1) ? (c >> 1) ^ 0xedb88820 : (c >> 1);
-	}
-	return c ^ 0xffffffff;
+	return ctx->inst_id++ & 0x1f;
+}
+
+// After request_wait, return the response as a struct pldm_msg + payload len.
+static const struct pldm_msg *pldm_resp(struct app_ctx *ctx, size_t *payload_len)
+{
+	*payload_len = ctx->resp_len > MCTP_PLDM_OVERHEAD ?
+			       ctx->resp_len - MCTP_PLDM_OVERHEAD :
+			       0;
+	return (const struct pldm_msg *)(ctx->resp_buf + 1);
 }
 
 static const char *pldm_type_name(int t)
 {
 	switch (t) {
-	case 0: return "Base";
+	case PLDM_BASE: return "Base";
 	case 1: return "SMBIOS";
-	case 2: return "Platform";
+	case PLDM_PLATFORM: return "Platform";
 	case 3: return "BIOS";
-	case 4: return "FRU";
-	case 5: return "FW-Update";
+	case PLDM_FRU: return "FRU";
+	case PLDM_FWUP: return "FW-Update";
 	case 6: return "RDE";
 	default: return "?";
 	}
+}
+
+// Decode a PLDM BCD version byte (0xFx -> x, else two BCD digits).
+static int bcd(uint8_t b)
+{
+	if ((b >> 4) == 0xf)
+		return b & 0x0f;
+	return (b >> 4) * 10 + (b & 0x0f);
 }
 
 static void fmt_types(char *out, size_t osz, const uint8_t *bits8)
@@ -63,30 +84,185 @@ static void fmt_cmds(char *out, size_t osz, const uint8_t *bits32)
 				      p ? "," : "", c);
 }
 
-// Build a PLDM request, send it, and wait for the matching response.
-static bool pldm_request(struct app_ctx *ctx, uint8_t eid, uint8_t type,
-			 uint8_t cmd, const uint8_t *data, size_t dlen,
-			 int timeout_ms)
+// ===================================================================
+// Requester role: discover and validate the DUT's PLDM terminus (libpldm).
+// ===================================================================
+static void pldm_discover(struct app_ctx *ctx, uint8_t eid, int to,
+			  struct results *r)
 {
-	uint8_t msg[64];
-	size_t n = 0;
-	msg[n++] = MCTP_MSG_TYPE_PLDM;
-	msg[n++] = PLDM_RQ | (ctx->inst_id++ & 0x1f); // Rq=1, D=0, instance
-	msg[n++] = (0 << 6) | (type & 0x3f);	      // hdr ver 0, PLDM type
-	msg[n++] = cmd;
-	if (data && dlen) {
-		memcpy(msg + n, data, dlen);
-		n += dlen;
+	uint8_t tx[512];
+	tx[0] = MCTP_MSG_TYPE_PLDM;
+	struct pldm_msg *req = (struct pldm_msg *)(tx + 1);
+	size_t pl;
+	const struct pldm_msg *rsp;
+
+	printf("\n-- requester: querying DUT PLDM (EID %u) via libpldm --\n",
+	       eid);
+
+	// GetTID
+	bool ok = encode_get_tid_req(pl_iid(ctx), req) == 0 &&
+		  request_wait(ctx, eid, tx,
+			       MCTP_PLDM_OVERHEAD + PLDM_GET_TID_REQ_BYTES,
+			       MCTP_MSG_TYPE_PLDM, PLDM_GET_TID, to);
+	uint8_t cc = 0xff, tid = 0;
+	if (ok) {
+		rsp = pldm_resp(ctx, &pl);
+		decode_get_tid_resp(rsp, pl, &cc, &tid);
 	}
-	return request_wait(ctx, eid, msg, n, MCTP_MSG_TYPE_PLDM, cmd,
-			    timeout_ms);
+	check(r, "PLDM GetTID", ok && cc == PLDM_SUCCESS, "cc=0x%02x tid=%u", cc,
+	      tid);
+
+	// GetPLDMTypes — ask the DUT what it supports (no libpldm decode helper,
+	// so read the 8-byte type bitfield from the payload directly).
+	ok = encode_get_types_req(pl_iid(ctx), req) == 0 &&
+	     request_wait(ctx, eid, tx,
+			  MCTP_PLDM_OVERHEAD + PLDM_GET_TYPES_REQ_BYTES,
+			  MCTP_MSG_TYPE_PLDM, PLDM_GET_PLDM_TYPES, to);
+	uint8_t types[8] = { 0 };
+	cc = 0xff;
+	if (ok) {
+		rsp = pldm_resp(ctx, &pl);
+		if (pl >= 9) {
+			cc = rsp->payload[0];
+			memcpy(types, &rsp->payload[1], 8);
+		}
+	}
+	char tbuf[160];
+	fmt_types(tbuf, sizeof(tbuf), types);
+	check(r, "PLDM GetPLDMTypes", ok && cc == PLDM_SUCCESS,
+	      "cc=0x%02x types=[%s]", cc, tbuf);
+	if (!(ok && cc == PLDM_SUCCESS))
+		return;
+
+	// For each supported PLDM type: GetPLDMVersion + GetPLDMCommands.
+	for (int t = 0; t < 64; t++) {
+		if (!(types[t / 8] & (1 << (t % 8))))
+			continue;
+
+		ver32_t ver = { 0 };
+		uint8_t vcc = 0xff;
+		uint32_t next = 0;
+		uint8_t flag = 0;
+		bool vok = encode_get_version_req(pl_iid(ctx), 0,
+						  PLDM_GET_FIRSTPART,
+						  (uint8_t)t, req) == 0 &&
+			   request_wait(ctx, eid, tx,
+					MCTP_PLDM_OVERHEAD +
+						PLDM_GET_VERSION_REQ_BYTES,
+					MCTP_MSG_TYPE_PLDM,
+					PLDM_GET_PLDM_VERSION, to);
+		if (vok) {
+			rsp = pldm_resp(ctx, &pl);
+			decode_get_version_resp(rsp, pl, &vcc, &next, &flag,
+						&ver);
+		}
+		char nm[40];
+		snprintf(nm, sizeof(nm), "  type %d(%s) version", t,
+			 pldm_type_name(t));
+		check(r, nm, vok && vcc == PLDM_SUCCESS, "cc=0x%02x ver=%d.%d.%d",
+		      vcc, bcd(ver.major), bcd(ver.minor), bcd(ver.update));
+
+		bitfield8_t cmds[PLDM_MAX_CMDS_PER_TYPE / 8];
+		memset(cmds, 0, sizeof(cmds));
+		uint8_t ccc = 0xff;
+		bool cok = encode_get_commands_req(pl_iid(ctx), (uint8_t)t, ver,
+						   req) == 0 &&
+			   request_wait(ctx, eid, tx,
+					MCTP_PLDM_OVERHEAD +
+						PLDM_GET_COMMANDS_REQ_BYTES,
+					MCTP_MSG_TYPE_PLDM,
+					PLDM_GET_PLDM_COMMANDS, to);
+		if (cok) {
+			rsp = pldm_resp(ctx, &pl);
+			decode_get_commands_resp(rsp, pl, &ccc, cmds);
+		}
+		char cbuf[256];
+		fmt_cmds(cbuf, sizeof(cbuf), (const uint8_t *)cmds);
+		char nm2[40];
+		snprintf(nm2, sizeof(nm2), "  type %d(%s) commands", t,
+			 pldm_type_name(t));
+		check(r, nm2, cok && ccc == PLDM_SUCCESS, "cc=0x%02x cmds=[%s]",
+		      ccc, cbuf);
+	}
+}
+
+// Read the DUT's FRU record table (FRU type 0x04) using libpldm.
+static void pldm_fru(struct app_ctx *ctx, uint8_t eid, int to,
+		     struct results *r)
+{
+	uint8_t tx[512];
+	tx[0] = MCTP_MSG_TYPE_PLDM;
+	struct pldm_msg *req = (struct pldm_msg *)(tx + 1);
+	size_t pl;
+	const struct pldm_msg *rsp;
+
+	printf("\n-- requester: reading DUT FRU table --\n");
+
+	// GetFRURecordTableMetadata
+	uint8_t cc = 0xff, vmaj = 0, vmin = 0;
+	uint32_t maxsz = 0, tablen = 0, csum = 0;
+	uint16_t total_rsi = 0, total_rec = 0;
+	bool ok = encode_get_fru_record_table_metadata_req(
+			  pl_iid(ctx), req,
+			  PLDM_GET_FRU_RECORD_TABLE_METADATA_REQ_BYTES) == 0 &&
+		  request_wait(
+			  ctx, eid, tx,
+			  MCTP_PLDM_OVERHEAD +
+				  PLDM_GET_FRU_RECORD_TABLE_METADATA_REQ_BYTES,
+			  MCTP_MSG_TYPE_PLDM,
+			  PLDM_GET_FRU_RECORD_TABLE_METADATA, to);
+	if (ok) {
+		rsp = pldm_resp(ctx, &pl);
+		decode_get_fru_record_table_metadata_resp(
+			rsp, pl, &cc, &vmaj, &vmin, &maxsz, &tablen, &total_rsi,
+			&total_rec, &csum);
+	}
+	check(r, "PLDM FRU TableMetadata", ok && cc == PLDM_SUCCESS,
+	      "cc=0x%02x records=%u table_len=%u", cc, total_rec, tablen);
+	if (!(ok && cc == PLDM_SUCCESS))
+		return;
+
+	// GetFRURecordTable (first part)
+	uint8_t tbl[1024];
+	size_t tbllen = 0;
+	uint32_t next = 0;
+	uint8_t flag = 0;
+	cc = 0xff;
+	ok = encode_get_fru_record_table_req(
+		     pl_iid(ctx), 0, PLDM_GET_FIRSTPART, req,
+		     PLDM_GET_FRU_RECORD_TABLE_REQ_BYTES) == 0 &&
+	     request_wait(ctx, eid, tx,
+			  MCTP_PLDM_OVERHEAD + PLDM_GET_FRU_RECORD_TABLE_REQ_BYTES,
+			  MCTP_MSG_TYPE_PLDM, PLDM_GET_FRU_RECORD_TABLE, to);
+	if (ok) {
+		rsp = pldm_resp(ctx, &pl);
+		decode_get_fru_record_table_resp_safe(rsp, pl, &cc, &next, &flag,
+						      tbl, &tbllen, sizeof(tbl));
+	}
+	check(r, "PLDM FRU RecordTable", ok && cc == PLDM_SUCCESS,
+	      "cc=0x%02x got %zu bytes", cc, tbllen);
+	if (ok && cc == PLDM_SUCCESS && ctx->verbose)
+		hexdump("   FRU table", tbl, tbllen);
 }
 
 // ===================================================================
 // Responder role: answer PLDM Base requests like a PLDM device.
-// Response layout in resp_buf: [0]=0x01 [1]=Rq/D/inst [2]=hdrver|type
-//                              [3]=cmd [4]=completion code [5..]=data
+// Built by hand (our device is simple); the wire layout is
+// [0]=0x01 MCTP [1]=Rq/D/inst [2]=hdrver|type [3]=cmd [4]=cc [5..]=data.
 // ===================================================================
+
+// CRC-32 (IEEE 802.3, reflected) — used in GetPLDMVersion responses.
+static uint32_t crc32_ieee(const uint8_t *p, size_t len)
+{
+	uint32_t c = 0xffffffff;
+	for (size_t i = 0; i < len; i++) {
+		c ^= p[i];
+		for (int k = 0; k < 8; k++)
+			c = (c & 1) ? (c >> 1) ^ 0xedb88820 : (c >> 1);
+	}
+	return c ^ 0xffffffff;
+}
+
 void pldm_handle_request(struct app_ctx *ctx, uint8_t src_eid, uint8_t msg_tag,
 			 const uint8_t *m, size_t len)
 {
@@ -99,33 +275,33 @@ void pldm_handle_request(struct app_ctx *ctx, uint8_t src_eid, uint8_t msg_tag,
 	uint8_t r[64];
 	size_t n = 0;
 	r[n++] = MCTP_MSG_TYPE_PLDM;
-	r[n++] = inst;		    // Rq=0, D=0, echo instance id
-	r[n++] = (0 << 6) | type;   // hdr ver 0, PLDM type
+	r[n++] = inst;		  // Rq=0, D=0, echo instance id
+	r[n++] = (0 << 6) | type; // hdr ver 0, PLDM type
 	r[n++] = cmd;
 
 	if (type != PLDM_BASE) {
-		r[n++] = PLDM_CC_ERROR_INVALID_TYPE;
+		r[n++] = PLDM_ERROR_INVALID_PLDM_TYPE;
 	} else {
 		switch (cmd) {
-		case PLDM_CMD_GET_TID:
-			r[n++] = PLDM_CC_SUCCESS;
+		case PLDM_GET_TID:
+			r[n++] = PLDM_SUCCESS;
 			r[n++] = PLDM_OUR_TID;
 			break;
-		case PLDM_CMD_GET_TYPES: {
-			r[n++] = PLDM_CC_SUCCESS;
+		case PLDM_GET_PLDM_TYPES: {
+			r[n++] = PLDM_SUCCESS;
 			uint8_t bits[8] = { 0 };
 			bits[0] |= 1 << PLDM_BASE; // we support PLDM Base only
 			memcpy(r + n, bits, 8);
 			n += 8;
 			break;
 		}
-		case PLDM_CMD_GET_VERSION: {
-			r[n++] = PLDM_CC_SUCCESS;
-			uint8_t next[4] = { 0, 0, 0, 0 }; // NextDataTransferHandle
+		case PLDM_GET_PLDM_VERSION: {
+			r[n++] = PLDM_SUCCESS;
+			uint8_t next[4] = { 0, 0, 0, 0 };
 			memcpy(r + n, next, 4);
 			n += 4;
-			r[n++] = 0x05; // TransferFlag = Start and End
-			uint8_t ver[4] = { 0xF1, 0xF0, 0xF0, 0x00 }; // 1.0.0
+			r[n++] = PLDM_START_AND_END;
+			uint8_t ver[4] = { 0x00, 0xf0, 0xf0, 0xf1 }; // 1.0.0
 			memcpy(r + n, ver, 4);
 			n += 4;
 			uint32_t crc = crc32_ieee(ver, 4);
@@ -133,19 +309,19 @@ void pldm_handle_request(struct app_ctx *ctx, uint8_t src_eid, uint8_t msg_tag,
 			n += 4;
 			break;
 		}
-		case PLDM_CMD_GET_COMMANDS: {
-			r[n++] = PLDM_CC_SUCCESS;
+		case PLDM_GET_PLDM_COMMANDS: {
+			r[n++] = PLDM_SUCCESS;
 			uint8_t bits[32] = { 0 };
-			bits[0] |= 1 << PLDM_CMD_GET_TID;	// 0x02
-			bits[0] |= 1 << PLDM_CMD_GET_VERSION;	// 0x03
-			bits[0] |= 1 << PLDM_CMD_GET_TYPES;	// 0x04
-			bits[0] |= 1 << PLDM_CMD_GET_COMMANDS;	// 0x05
+			bits[0] |= 1 << PLDM_GET_TID;
+			bits[0] |= 1 << PLDM_GET_PLDM_VERSION;
+			bits[0] |= 1 << PLDM_GET_PLDM_TYPES;
+			bits[0] |= 1 << PLDM_GET_PLDM_COMMANDS;
 			memcpy(r + n, bits, 32);
 			n += 32;
 			break;
 		}
 		default:
-			r[n++] = PLDM_CC_ERROR_UNSUPPORTED;
+			r[n++] = PLDM_ERROR_UNSUPPORTED_PLDM_CMD;
 			break;
 		}
 	}
@@ -153,72 +329,6 @@ void pldm_handle_request(struct app_ctx *ctx, uint8_t src_eid, uint8_t msg_tag,
 	if (ctx->verbose)
 		hexdump("   PLDM responding", r, n);
 	mctp_message_tx(ctx->mctp, src_eid, false, msg_tag, r, n);
-}
-
-// ===================================================================
-// Requester role: discover and validate the DUT's PLDM terminus.
-// ===================================================================
-static void pldm_discover(struct app_ctx *ctx, uint8_t eid, int to,
-			  struct results *r)
-{
-	printf("\n-- requester: querying DUT PLDM (EID %u) --\n", eid);
-
-	// GetTID
-	bool ok = pldm_request(ctx, eid, PLDM_BASE, PLDM_CMD_GET_TID, NULL, 0,
-			       to);
-	uint8_t cc = (ok && ctx->resp_len >= 5) ? ctx->resp_buf[4] : 0xff;
-	uint8_t tid = (ok && ctx->resp_len >= 6) ? ctx->resp_buf[5] : 0;
-	check(r, "PLDM GetTID", ok && cc == 0, "cc=0x%02x tid=%u", cc, tid);
-
-	// GetPLDMTypes — ask the DUT what it supports before going further.
-	ok = pldm_request(ctx, eid, PLDM_BASE, PLDM_CMD_GET_TYPES, NULL, 0, to);
-	cc = (ok && ctx->resp_len >= 5) ? ctx->resp_buf[4] : 0xff;
-	uint8_t types[8] = { 0 };
-	if (ok && cc == 0 && ctx->resp_len >= 13)
-		memcpy(types, ctx->resp_buf + 5, 8);
-	char tbuf[128];
-	fmt_types(tbuf, sizeof(tbuf), types);
-	check(r, "PLDM GetPLDMTypes", ok && cc == 0, "cc=0x%02x types=[%s]", cc,
-	      tbuf);
-	if (!(ok && cc == 0))
-		return;
-
-	// For each supported PLDM type: GetPLDMVersion + GetPLDMCommands.
-	for (int t = 0; t < 64; t++) {
-		if (!(types[t / 8] & (1 << (t % 8))))
-			continue;
-
-		uint8_t ver[4] = { 0 };
-		uint8_t vreq[6] = { 0, 0, 0, 0, 0x01, (uint8_t)t };
-		bool vok = pldm_request(ctx, eid, PLDM_BASE,
-					PLDM_CMD_GET_VERSION, vreq, 6, to);
-		uint8_t vcc = (vok && ctx->resp_len >= 5) ? ctx->resp_buf[4] :
-							    0xff;
-		if (vok && vcc == 0 && ctx->resp_len >= 14)
-			memcpy(ver, ctx->resp_buf + 10, 4);
-		char nm[40];
-		snprintf(nm, sizeof(nm), "  type %d(%s) version", t,
-			 pldm_type_name(t));
-		check(r, nm, vok && vcc == 0,
-		      "cc=0x%02x ver=%02x.%02x.%02x.%02x", vcc, ver[0], ver[1],
-		      ver[2], ver[3]);
-
-		uint8_t creq[5] = { (uint8_t)t, ver[0], ver[1], ver[2] };
-		creq[4] = ver[3];
-		bool cok = pldm_request(ctx, eid, PLDM_BASE,
-					PLDM_CMD_GET_COMMANDS, creq, 5, to);
-		uint8_t ccc = (cok && ctx->resp_len >= 5) ? ctx->resp_buf[4] :
-							    0xff;
-		uint8_t cmds[32] = { 0 };
-		if (cok && ccc == 0 && ctx->resp_len >= 37)
-			memcpy(cmds, ctx->resp_buf + 5, 32);
-		char cbuf[256];
-		fmt_cmds(cbuf, sizeof(cbuf), cmds);
-		char nm2[40];
-		snprintf(nm2, sizeof(nm2), "  type %d(%s) commands", t,
-			 pldm_type_name(t));
-		check(r, nm2, cok && ccc == 0, "cc=0x%02x cmds=[%s]", ccc, cbuf);
-	}
 }
 
 // ===================================================================
@@ -274,8 +384,7 @@ static bool pldm_selftest(struct app_ctx *ctx, const char *name, uint8_t type,
 	// [10]=type [11]=cmd [12]=completion code
 	bool ok = ctx->cap_len >= 13 && c[1] == 0x0f &&
 		  (c[0] >> 1) == rem_addr && c[8] == MCTP_MSG_TYPE_PLDM &&
-		  !(c[9] & PLDM_RQ) && c[11] == cmd &&
-		  c[12] == PLDM_CC_SUCCESS;
+		  !(c[9] & PLDM_RQ) && c[11] == cmd && c[12] == PLDM_SUCCESS;
 	uint8_t cc = ctx->cap_len >= 13 ? c[12] : 0xff;
 	check(r, name, ok, "cmd=0x%02x cc=0x%02x", cmd, cc);
 	return ok;
@@ -284,22 +393,23 @@ static bool pldm_selftest(struct app_ctx *ctx, const char *name, uint8_t type,
 static void pldm_responder_selftests(struct app_ctx *ctx, struct results *r)
 {
 	printf("\n-- responder: our PLDM device answers injected requests --\n");
-	pldm_selftest(ctx, "PLDM resp GetTID", PLDM_BASE, PLDM_CMD_GET_TID, NULL,
-		      0, r);
+	pldm_selftest(ctx, "PLDM resp GetTID", PLDM_BASE, PLDM_GET_TID, NULL, 0,
+		      r);
 	pldm_selftest(ctx, "PLDM resp GetPLDMTypes", PLDM_BASE,
-		      PLDM_CMD_GET_TYPES, NULL, 0, r);
-	uint8_t vreq[6] = { 0, 0, 0, 0, 0x01, PLDM_BASE };
+		      PLDM_GET_PLDM_TYPES, NULL, 0, r);
+	uint8_t vreq[6] = { 0, 0, 0, 0, PLDM_GET_FIRSTPART, PLDM_BASE };
 	pldm_selftest(ctx, "PLDM resp GetPLDMVersion", PLDM_BASE,
-		      PLDM_CMD_GET_VERSION, vreq, 6, r);
-	uint8_t creq[5] = { PLDM_BASE, 0xF1, 0xF0, 0xF0, 0x00 };
+		      PLDM_GET_PLDM_VERSION, vreq, 6, r);
+	uint8_t creq[5] = { PLDM_BASE, 0x00, 0xf0, 0xf0, 0xf1 };
 	pldm_selftest(ctx, "PLDM resp GetPLDMCommands", PLDM_BASE,
-		      PLDM_CMD_GET_COMMANDS, creq, 5, r);
+		      PLDM_GET_PLDM_COMMANDS, creq, 5, r);
 }
 
 void run_pldm_bench(struct app_ctx *ctx, uint8_t dst_eid, int timeout_ms,
 		    struct results *r)
 {
-	printf("\n== PLDM bench (OpenBMC-style) ==\n");
+	printf("\n== PLDM bench (libpldm, OpenBMC-style) ==\n");
 	pldm_discover(ctx, dst_eid, timeout_ms, r);
+	pldm_fru(ctx, dst_eid, timeout_ms, r);
 	pldm_responder_selftests(ctx, r);
 }

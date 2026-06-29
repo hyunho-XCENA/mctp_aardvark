@@ -1,3 +1,6 @@
 [submodule "libmctp"]
 	path = libmctp
 	url = https://github.com/openbmc/libmctp.git
+[submodule "libpldm"]
+	path = libpldm
+	url = https://github.com/openbmc/libpldm.git
