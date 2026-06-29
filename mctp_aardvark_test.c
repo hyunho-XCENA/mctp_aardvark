@@ -23,38 +23,13 @@
 #include <ctype.h>
 #include <errno.h>
 #include <poll.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
-#include "aardvark.h"
-
-#include "libmctp.h"
-#include "libmctp-i2c.h"
-#include "libmctp-sizes.h" // provides MCTP_SIZEOF_BINDING_I2C
-#include "i2c-internal.h"   // struct mctp_binding_i2c (for raw neighbour access)
-
-// ---- MCTP message-type / control constants ----
-#define MCTP_MSG_TYPE_CONTROL	  0x00
-#define MCTP_CTRL_FLAG_REQUEST	  0x80 // Rq=1, D=0
-#define MCTP_CTRL_CMD_SET_EID	  0x01
-#define MCTP_CTRL_CMD_GET_EID	  0x02
-#define MCTP_CTRL_CMD_GET_UUID	  0x03
-#define MCTP_CTRL_CMD_GET_VERSION 0x04
-#define MCTP_CTRL_CMD_GET_TYPES	  0x05
-#define EXPECT_NONE		  0xff
-
-#define MCTP_EID_NULL_LOCAL 0x00 // NULL destination EID, used for discovery
-
-// MCTP header flag bits
-#define MCTP_FLAG_SOM 0x80
-#define MCTP_FLAG_EOM 0x40
-#define MCTP_FLAG_TO  0x08
+#include "mctp_test.h"
 
 // ---- Defaults (override on the command line) ----
 #define DEF_PORT     0
@@ -63,44 +38,7 @@
 #define DEF_OWN_EID  8
 // Peer address/EID are auto-discovered when not given on the command line.
 
-struct app_ctx {
-	Aardvark aa;
-	struct mctp *mctp;
-	struct mctp_binding_i2c *i2c;
-	int verbose;
-	int pec;	  // append/verify SMBus PEC (CRC-8) byte
-	uint8_t own_addr; // our 7-bit slave address
-	uint8_t own_eid;
-	uint8_t inst_id;  // control message instance id, auto-increment
-
-	// capture mode: aa_tx stores the frame instead of touching hardware
-	int capture;
-	uint8_t cap_buf[300];
-	size_t cap_len;
-
-	// pending master request, awaiting matching response
-	uint8_t expect_cmd;
-	int resp_got;
-	uint8_t resp_buf[300]; // the MCTP message payload of the response
-	size_t resp_len;
-	uint8_t resp_src_eid;
-
-	// live-listen accounting
-	int req_seen;
-
-	// last physical TX status (for fast scan: skip wait on SLA_NACK)
-	int last_tx_status;
-	int quiet; // suppress per-TX status lines (used during bus scan)
-};
-
-// ---- pass/fail bookkeeping ----
-struct results {
-	int pass;
-	int fail;
-};
-
-static void check(struct results *r, const char *name, bool ok,
-		  const char *fmt, ...)
+void check(struct results *r, const char *name, bool ok, const char *fmt, ...)
 {
 	char detail[256];
 	va_list ap;
@@ -122,7 +60,7 @@ static uint64_t now_ms(void *ctx)
 	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-static void hexdump(const char *tag, const uint8_t *p, size_t len)
+void hexdump(const char *tag, const uint8_t *p, size_t len)
 {
 	printf("%s [%zu]:", tag, len);
 	for (size_t i = 0; i < len; i++)
@@ -191,6 +129,16 @@ static int aa_tx(const void *buf, size_t len, void *vctx)
 	return 0;
 }
 
+static void record_resp(struct app_ctx *ctx, uint8_t src_eid, const uint8_t *m,
+			size_t len)
+{
+	size_t n = len > sizeof(ctx->resp_buf) ? sizeof(ctx->resp_buf) : len;
+	memcpy(ctx->resp_buf, m, n);
+	ctx->resp_len = len;
+	ctx->resp_src_eid = src_eid;
+	ctx->resp_got = 1;
+}
+
 static void rx_all(uint8_t src_eid, bool tag_owner, uint8_t msg_tag, void *vctx,
 		   void *msg, size_t len)
 {
@@ -203,15 +151,23 @@ static void rx_all(uint8_t src_eid, bool tag_owner, uint8_t msg_tag, void *vctx,
 		hexdump("   payload", m, len);
 	}
 
-	// Record a control response we are waiting for.
-	if (len >= 3 && m[0] == MCTP_MSG_TYPE_CONTROL &&
-	    !(m[1] & MCTP_CTRL_FLAG_REQUEST) && m[2] == ctx->expect_cmd) {
-		memcpy(ctx->resp_buf, m, len > sizeof(ctx->resp_buf) ?
-						sizeof(ctx->resp_buf) : len);
-		ctx->resp_len = len;
-		ctx->resp_src_eid = src_eid;
-		ctx->resp_got = 1;
+	// PLDM request addressed to us -> respond like a PLDM device.
+	// (MCTP control requests are auto-handled by libmctp, not delivered here.)
+	if (len >= 4 && m[0] == MCTP_MSG_TYPE_PLDM && (m[1] & PLDM_RQ)) {
+		pldm_handle_request(ctx, src_eid, msg_tag, m, len);
+		return;
 	}
+
+	// Otherwise, record a response we are waiting for (control or PLDM).
+	if (ctx->expect_msgtype == 0xff || len < 1 ||
+	    m[0] != ctx->expect_msgtype)
+		return;
+	if (m[0] == MCTP_MSG_TYPE_CONTROL && len >= 3 &&
+	    !(m[1] & MCTP_CTRL_FLAG_REQUEST) && m[2] == ctx->expect_cmd)
+		record_resp(ctx, src_eid, m, len);
+	else if (m[0] == MCTP_MSG_TYPE_PLDM && len >= 4 && !(m[1] & PLDM_RQ) &&
+		 m[3] == ctx->expect_cmd)
+		record_resp(ctx, src_eid, m, len);
 }
 
 // One receive cycle: drain any pending Aardvark slave reception into libmctp.
@@ -248,40 +204,27 @@ static void pump_rx(struct app_ctx *ctx, int timeout_ms)
 		aa_i2c_slave_write_stats(ctx->aa);
 }
 
-// Send an MCTP control request over the real bus (capture must be off).
-static void send_ctrl(struct app_ctx *ctx, uint8_t dst_eid, uint8_t cmd,
-		      const uint8_t *extra, size_t extra_len)
+// Send a complete MCTP message and wait for a matching response. Shared by the
+// MCTP control validator and the PLDM bench (see mctp_test.h).
+bool request_wait(struct app_ctx *ctx, uint8_t dst_eid, const uint8_t *msg,
+		  size_t msg_len, uint8_t expect_msgtype, uint8_t expect_cmd,
+		  int timeout_ms)
 {
-	uint8_t msg[64];
-	size_t n = 0;
-	msg[n++] = MCTP_MSG_TYPE_CONTROL;
-	msg[n++] = MCTP_CTRL_FLAG_REQUEST | (ctx->inst_id++ & 0x1f);
-	msg[n++] = cmd;
-	if (extra && extra_len) {
-		memcpy(msg + n, extra, extra_len);
-		n += extra_len;
-	}
-	int rc = mctp_message_tx(ctx->mctp, dst_eid, true, 0, msg, n);
+	ctx->resp_got = 0;
+	ctx->resp_len = 0;
+	ctx->expect_msgtype = expect_msgtype;
+	ctx->expect_cmd = expect_cmd;
+	ctx->last_tx_status = AA_I2C_STATUS_OK;
+
+	int rc = mctp_message_tx(ctx->mctp, dst_eid, true, 0, msg, msg_len);
 	if (rc != 0)
 		fprintf(stderr, "mctp_message_tx returned %d\n", rc);
 	for (int i = 0; i < 1000 && !mctp_is_tx_ready(ctx->mctp, dst_eid); i++)
 		mctp_i2c_tx_poll(ctx->i2c);
-}
 
-// ===================================================================
-// MASTER role: send a control request and wait for the matching response.
-// ===================================================================
-static bool master_request(struct app_ctx *ctx, uint8_t dst_eid, uint8_t cmd,
-			   const uint8_t *extra, size_t elen, int timeout_ms)
-{
-	ctx->resp_got = 0;
-	ctx->resp_len = 0;
-	ctx->expect_cmd = cmd;
-	ctx->last_tx_status = AA_I2C_STATUS_OK;
-	send_ctrl(ctx, dst_eid, cmd, extra, elen);
 	// No device acknowledged the address: nothing to wait for.
 	if (ctx->last_tx_status == AA_I2C_STATUS_SLA_NACK) {
-		ctx->expect_cmd = EXPECT_NONE;
+		ctx->expect_msgtype = 0xff;
 		return false;
 	}
 	uint64_t dl = now_ms(NULL) + (uint64_t)timeout_ms;
@@ -289,8 +232,27 @@ static bool master_request(struct app_ctx *ctx, uint8_t dst_eid, uint8_t cmd,
 		pump_rx(ctx, 20);
 		mctp_i2c_tx_poll(ctx->i2c);
 	}
-	ctx->expect_cmd = EXPECT_NONE;
+	ctx->expect_msgtype = 0xff;
 	return ctx->resp_got;
+}
+
+// ===================================================================
+// MASTER role: send an MCTP control request and wait for the response.
+// ===================================================================
+static bool master_request(struct app_ctx *ctx, uint8_t dst_eid, uint8_t cmd,
+			   const uint8_t *extra, size_t elen, int timeout_ms)
+{
+	uint8_t msg[64];
+	size_t n = 0;
+	msg[n++] = MCTP_MSG_TYPE_CONTROL;
+	msg[n++] = MCTP_CTRL_FLAG_REQUEST | (ctx->inst_id++ & 0x1f);
+	msg[n++] = cmd;
+	if (extra && elen) {
+		memcpy(msg + n, extra, elen);
+		n += elen;
+	}
+	return request_wait(ctx, dst_eid, msg, n, MCTP_MSG_TYPE_CONTROL, cmd,
+			    timeout_ms);
 }
 
 static void run_master_tests(struct app_ctx *ctx, uint8_t dst_eid,
@@ -674,6 +636,7 @@ static void usage(const char *prog)
 		"  -A        AUTO-DISCOVER the peer (OpenBMC-style enumeration)\n"
 		"  -R        scan the whole I2C bus (0x08..0x77) for endpoints\n"
 		"  -x eid    assign this EID during discovery (Set Endpoint ID)\n"
+		"  -G        PLDM bench: discover DUT's PLDM + responder self-tests\n"
 		"  -L secs   also LIVE-listen for DUT requests\n"
 		"  -i        interactive shell (no validator)\n"
 		"  -v        verbose (wire dumps + libmctp debug)\n",
@@ -687,10 +650,10 @@ int main(int argc, char **argv)
 	int dst_addr = -1, dst_eid = -1; // <0 => auto-discover
 	int power = 0, pullup = 0, verbose = 0, pec = 0;
 	int only_master = 0, only_slave = 0, interactive = 0, live = 0;
-	int discover = 0, scan = 0, assign_eid = 0;
+	int discover = 0, scan = 0, assign_eid = 0, pldm = 0;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "p:b:s:e:d:E:t:L:x:CuPmSARivh")) != -1) {
+	while ((opt = getopt(argc, argv, "p:b:s:e:d:E:t:L:x:CuPmSARGivh")) != -1) {
 		switch (opt) {
 		case 'p': port = (int)strtol(optarg, NULL, 0); break;
 		case 'b': bitrate = (int)strtol(optarg, NULL, 0); break;
@@ -708,6 +671,7 @@ int main(int argc, char **argv)
 		case 'A': discover = 1; break;
 		case 'R': discover = 1; scan = 1; break;
 		case 'x': assign_eid = (int)strtol(optarg, NULL, 0); break;
+		case 'G': pldm = 1; break;
 		case 'i': interactive = 1; break;
 		case 'v': verbose = 1; break;
 		default: usage(argv[0]); return 1;
@@ -772,8 +736,8 @@ int main(int argc, char **argv)
 		scan = 1;
 
 	// Modes that send requests to a specific EID need a concrete target.
-	bool master_will_run = !interactive && !discover && !only_slave;
-	if (master_will_run || interactive) {
+	bool need_target = interactive || pldm || (!discover && !only_slave);
+	if (need_target) {
 		if (dst_addr < 0) {
 			uint8_t fa = 0, fe = 0;
 			printf("\nNo peer given; scanning bus for an endpoint...\n");
@@ -813,6 +777,8 @@ int main(int argc, char **argv)
 		if (discover) {
 			run_discovery(&ctx, (uint8_t)dst_addr, scan, assign_eid,
 				      timeout, &r);
+		} else if (pldm) {
+			run_pldm_bench(&ctx, (uint8_t)dst_eid, timeout, &r);
 		} else {
 			if (!only_slave)
 				run_master_tests(&ctx, (uint8_t)dst_eid,

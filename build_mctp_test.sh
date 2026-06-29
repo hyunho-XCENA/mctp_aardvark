@@ -10,6 +10,7 @@ MCTP_BUILD="$MCTP/build-meson"
 # the working dir / LD path), exposing the aa_* API. Compile it in and link -ldl.
 gcc -Wall -Wextra -O2 \
     "$ROOT/mctp_aardvark_test.c" \
+    "$ROOT/pldm_test.c" \
     "$AA/aardvark.c" \
     -I"$AA" -I"$MCTP" -I"$MCTP_BUILD" \
     "$MCTP_BUILD/libmctp.so" \
