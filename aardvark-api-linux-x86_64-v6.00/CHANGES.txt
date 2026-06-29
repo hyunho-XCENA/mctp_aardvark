@@ -1,0 +1,44 @@
+                      Aardvark I2C/SPI Software
+                      -------------------------
+
+Changes for v6.00 (2024-02-08)
+------------------------------
+- Added support for Linux ARM 64-bit
+- Added support for Windows ARM 64-bit
+- Added support for macOS 14 Sonoma
+- Performance and stability improvements
+
+
+Changes for v5.70 (2022-09-30)
+------------------------------
+- Added support for Apple M1
+- Added support for macOS 13 Ventura
+- Improvements for Windows
+
+
+Changes for v5.60 (2022-06-16)
+------------------------------
+- Added support for Windows 11
+- Added support for macOS 12 Monterey
+- Added support for Python 3.10+
+
+
+Changes for v5.50 (2020-11-05)
+------------------------------
+- Added support for ARM Linux
+- Added support for macOS 11 Big Sur
+- Added support for Python 3.9
+- Improved device detection on Linux
+
+
+Changes for v5.40 (2019-10-16)
+------------------------------
+- Added support for latest Python versions
+- Examples use Python 3 by default
+- API bindings support Python 3.5-3.8 and 2.6-2.7
+
+
+Changes for v5.30 (2017-12-13)
+------------------------------
+- Added Support for Python 3
+- API bindings support Python 2.5-3.6
