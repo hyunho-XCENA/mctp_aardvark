@@ -96,6 +96,9 @@ sudo udevadm control --reload && sudo udevadm trigger   # 후 장치 재연결
 
 종료 코드는 실패가 있으면 1이라 CI에 연동할 수 있습니다.
 
+> **타겟 자동 탐지**: `-d`/`-E`를 주지 않으면 버스를 스캔해 첫 엔드포인트를 찾아 그 주소·EID로
+> 테스트합니다(`-d`만 주면 해당 주소의 EID를 자동 학습). 즉 주소를 몰라도 동작합니다.
+
 ## 테스트 모드
 
 | 모드 | 검증 내용 | 하드웨어 왕복 |
@@ -118,8 +121,8 @@ sudo udevadm control --reload && sudo udevadm trigger   # 후 장치 재연결
 | `-b kHz` | I2C 비트레이트 | 100 |
 | `-s addr` | 자기 7-bit I2C 주소 | 0x20 |
 | `-e eid` | 자기 MCTP EID | 8 |
-| `-d addr` | peer 7-bit I2C 주소 | 0x42 |
-| `-E eid` | peer MCTP EID | 0x12 |
+| `-d addr` | peer 7-bit I2C 주소 | 자동 디스커버리 |
+| `-E eid` | peer MCTP EID | 자동 학습 |
 | `-t ms` | master 응답 타임아웃 | 1000 |
 | `-C` | SMBus PEC(CRC-8) 사용 | off |
 | `-u` | I2C 풀업 활성화 | off |
