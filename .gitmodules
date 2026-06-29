@@ -1,0 +1,3 @@
+[submodule "libmctp"]
+	path = libmctp
+	url = https://github.com/openbmc/libmctp.git
