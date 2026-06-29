@@ -61,8 +61,7 @@
 #define DEF_BITRATE  100	// kHz (SMBus standard)
 #define DEF_OWN_ADDR 0x20	// our 7-bit I2C slave address
 #define DEF_OWN_EID  8
-#define DEF_DST_ADDR 0x42	// peer 7-bit I2C address
-#define DEF_DST_EID  0x12
+// Peer address/EID are auto-discovered when not given on the command line.
 
 struct app_ctx {
 	Aardvark aa;
@@ -544,6 +543,44 @@ static bool discover_endpoint(struct app_ctx *ctx, uint8_t phys,
 	return true;
 }
 
+// Scan the bus and return the first endpoint's physical address and EID.
+static bool auto_find_first(struct app_ctx *ctx, int timeout_ms,
+			    uint8_t *out_addr, uint8_t *out_eid)
+{
+	int to = timeout_ms < 200 ? timeout_ms : 200;
+	ctx->quiet = 1;
+	bool found = false;
+	for (uint8_t a = 0x08; a <= 0x77; a++) {
+		if (a == ctx->own_addr)
+			continue;
+		neigh_set_raw(ctx->i2c, MCTP_EID_NULL_LOCAL, a);
+		if (master_request(ctx, MCTP_EID_NULL_LOCAL,
+				   MCTP_CTRL_CMD_GET_EID, NULL, 0, to) &&
+		    ctx->resp_len >= 5) {
+			*out_addr = a;
+			*out_eid = ctx->resp_buf[4];
+			found = true;
+			break;
+		}
+	}
+	ctx->quiet = 0;
+	return found;
+}
+
+// Learn the EID of the endpoint at a known physical address (NULL-EID Get EID).
+static bool probe_eid_at(struct app_ctx *ctx, uint8_t addr, int timeout_ms,
+			 uint8_t *out_eid)
+{
+	neigh_set_raw(ctx->i2c, MCTP_EID_NULL_LOCAL, addr);
+	if (master_request(ctx, MCTP_EID_NULL_LOCAL, MCTP_CTRL_CMD_GET_EID, NULL,
+			   0, timeout_ms) &&
+	    ctx->resp_len >= 5) {
+		*out_eid = ctx->resp_buf[4];
+		return true;
+	}
+	return false;
+}
+
 static void run_discovery(struct app_ctx *ctx, uint8_t peer_addr, int scan,
 			  int assign_eid, int timeout_ms, struct results *r)
 {
@@ -626,8 +663,8 @@ static void usage(const char *prog)
 		"  -b kHz    I2C bitrate               (default %d)\n"
 		"  -s addr   our 7-bit I2C address     (default 0x%02x)\n"
 		"  -e eid    our MCTP EID              (default %d)\n"
-		"  -d addr   peer 7-bit I2C address    (default 0x%02x)\n"
-		"  -E eid    peer MCTP EID             (default 0x%02x)\n"
+		"  -d addr   peer 7-bit I2C address    (default: auto-discover)\n"
+		"  -E eid    peer MCTP EID             (default: auto-learn)\n"
 		"  -t ms     master response timeout   (default 1000)\n"
 		"  -C        use SMBus PEC (CRC-8)\n"
 		"  -u        enable I2C pullups\n"
@@ -640,15 +677,14 @@ static void usage(const char *prog)
 		"  -L secs   also LIVE-listen for DUT requests\n"
 		"  -i        interactive shell (no validator)\n"
 		"  -v        verbose (wire dumps + libmctp debug)\n",
-		prog, DEF_PORT, DEF_BITRATE, DEF_OWN_ADDR, DEF_OWN_EID,
-		DEF_DST_ADDR, DEF_DST_EID);
+		prog, DEF_PORT, DEF_BITRATE, DEF_OWN_ADDR, DEF_OWN_EID);
 }
 
 int main(int argc, char **argv)
 {
 	int port = DEF_PORT, bitrate = DEF_BITRATE, timeout = 1000;
 	int own_addr = DEF_OWN_ADDR, own_eid = DEF_OWN_EID;
-	int dst_addr = DEF_DST_ADDR, dst_eid = DEF_DST_EID;
+	int dst_addr = -1, dst_eid = -1; // <0 => auto-discover
 	int power = 0, pullup = 0, verbose = 0, pec = 0;
 	int only_master = 0, only_slave = 0, interactive = 0, live = 0;
 	int discover = 0, scan = 0, assign_eid = 0;
@@ -682,7 +718,12 @@ int main(int argc, char **argv)
 	printf("  port=%d bitrate=%dkHz pec=%s\n", port, bitrate,
 	       pec ? "on" : "off");
 	printf("  self : addr=0x%02x eid=%d\n", own_addr, own_eid);
-	printf("  peer : addr=0x%02x eid=%d\n", dst_addr, dst_eid);
+	if (dst_addr < 0)
+		printf("  peer : auto-discover\n");
+	else if (dst_eid < 0)
+		printf("  peer : addr=0x%02x eid=auto\n", dst_addr);
+	else
+		printf("  peer : addr=0x%02x eid=%d\n", dst_addr, dst_eid);
 
 	Aardvark aa = aa_open(port);
 	if (aa <= 0) {
@@ -723,12 +764,51 @@ int main(int argc, char **argv)
 	mctp_i2c_setup(i2c, (uint8_t)own_addr, aa_tx, &ctx);
 	mctp_register_bus(mctp, mctp_binding_i2c_core(i2c), (uint8_t)own_eid);
 	mctp_set_rx_all(mctp, rx_all, &ctx);
-	mctp_i2c_set_neighbour(i2c, (uint8_t)dst_eid, (uint8_t)dst_addr);
 
 	int rc = 0;
-	if (interactive) {
+
+	// "-A" with no explicit address behaves as a full bus scan.
+	if (discover && dst_addr < 0)
+		scan = 1;
+
+	// Modes that send requests to a specific EID need a concrete target.
+	bool master_will_run = !interactive && !discover && !only_slave;
+	if (master_will_run || interactive) {
+		if (dst_addr < 0) {
+			uint8_t fa = 0, fe = 0;
+			printf("\nNo peer given; scanning bus for an endpoint...\n");
+			if (auto_find_first(&ctx, timeout, &fa, &fe)) {
+				dst_addr = fa;
+				dst_eid = fe;
+				printf("Discovered endpoint: addr=0x%02x eid=0x%02x\n",
+				       dst_addr, dst_eid);
+			} else {
+				fprintf(stderr, "no endpoint found "
+						"(try -C for PEC, or -d <addr>)\n");
+				rc = 1;
+			}
+		} else if (dst_eid < 0) {
+			uint8_t fe = 0;
+			if (probe_eid_at(&ctx, (uint8_t)dst_addr, timeout,
+					 &fe)) {
+				dst_eid = fe;
+				printf("\nLearned EID 0x%02x at addr 0x%02x\n",
+				       dst_eid, dst_addr);
+			} else {
+				fprintf(stderr,
+					"no endpoint at 0x%02x (try -C)\n",
+					dst_addr);
+				rc = 1;
+			}
+		}
+		if (rc == 0)
+			mctp_i2c_set_neighbour(i2c, (uint8_t)dst_eid,
+					       (uint8_t)dst_addr);
+	}
+
+	if (rc == 0 && interactive) {
 		run_interactive(&ctx, (uint8_t)dst_eid);
-	} else {
+	} else if (rc == 0) {
 		struct results r = { 0, 0 };
 		if (discover) {
 			run_discovery(&ctx, (uint8_t)dst_addr, scan, assign_eid,
