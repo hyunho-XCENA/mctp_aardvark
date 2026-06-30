@@ -898,6 +898,7 @@ static void usage(const char *prog)
 		"  -T        PLDM Platform validator: walk PDRs + read sensors/effecters\n"
 		"  -W        with -T, also round-trip the Set* write commands\n"
 		"  -O        OpenBMC mctpd-style enrollment: enroll endpoint(s) + routing table\n"
+		"  -U        PLDM Firmware Update validator (read-only: identifiers/params/status)\n"
 		"  -D id:st  drive state effecter <id> to state <st> (e.g. -D 5:2; changes DUT)\n"
 		"  -L secs   also LIVE-listen for DUT requests\n"
 		"  -i        interactive shell (no validator)\n"
@@ -913,11 +914,11 @@ int main(int argc, char **argv)
 	int power = 0, pullup = 0, verbose = 0, pec = 0;
 	int only_master = 0, only_slave = 0, interactive = 0, live = 0;
 	int discover = 0, scan = 0, assign_eid = 0, pldm = 0;
-	int platform = 0, allow_writes = 0, enroll = 0;
+	int platform = 0, allow_writes = 0, enroll = 0, fwup = 0;
 	int drive = 0, drive_eff = 0, drive_state = 0;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "p:b:s:e:d:E:t:L:x:D:CuPmSARGTWOivh")) != -1) {
+	while ((opt = getopt(argc, argv, "p:b:s:e:d:E:t:L:x:D:CuPmSARGTWOUivh")) != -1) {
 		switch (opt) {
 		case 'p': port = (int)strtol(optarg, NULL, 0); break;
 		case 'b': bitrate = (int)strtol(optarg, NULL, 0); break;
@@ -939,6 +940,7 @@ int main(int argc, char **argv)
 		case 'T': platform = 1; break;
 		case 'W': allow_writes = 1; break;
 		case 'O': enroll = 1; break;
+		case 'U': fwup = 1; break;
 		case 'D': {
 			// -D id:state  (decimal or 0x.. hex), e.g. -D 5:2
 			char *colon = strchr(optarg, ':');
@@ -1017,7 +1019,7 @@ int main(int argc, char **argv)
 	// Modes that send requests to a specific EID need a concrete target.
 	// Enrollment does its own NULL-EID probing (and scans the whole bus
 	// when no -d is given), so it resolves its own targets.
-	bool need_target = interactive || pldm || platform || drive ||
+	bool need_target = interactive || pldm || platform || drive || fwup ||
 			   (!discover && !enroll && !only_slave);
 	if (need_target) {
 		if (dst_addr < 0) {
@@ -1072,6 +1074,8 @@ int main(int argc, char **argv)
 						(uint16_t)drive_eff,
 						(uint8_t)drive_state, timeout,
 						&r);
+		} else if (fwup) {
+			run_pldm_fwup_bench(&ctx, (uint8_t)dst_eid, timeout, &r);
 		} else {
 			if (!only_slave)
 				run_master_tests(&ctx, (uint8_t)dst_eid,

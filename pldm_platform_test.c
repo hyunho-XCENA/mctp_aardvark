@@ -28,6 +28,7 @@
 
 #include <libpldm/base.h>
 #include <libpldm/platform.h>
+#include <libpldm/pdr.h>
 #include <libpldm/pldm_types.h>
 
 #define MCTP_PLDM_OVERHEAD (1 + sizeof(struct pldm_msg_hdr))
@@ -226,6 +227,176 @@ static void parse_pdr(struct inventory *inv, const uint8_t *rec, size_t len)
 	}
 }
 
+static const char *pdr_type_name(uint8_t t)
+{
+	switch (t) {
+	case PLDM_TERMINUS_LOCATOR_PDR:		   return "TerminusLocator";
+	case PLDM_NUMERIC_SENSOR_PDR:		   return "NumericSensor";
+	case PLDM_NUMERIC_SENSOR_INITIALIZATION_PDR: return "NumericSensorInit";
+	case PLDM_STATE_SENSOR_PDR:		   return "StateSensor";
+	case PLDM_STATE_SENSOR_INITIALIZATION_PDR: return "StateSensorInit";
+	case PLDM_SENSOR_AUXILIARY_NAMES_PDR:	   return "SensorAuxNames";
+	case PLDM_OEM_UNIT_PDR:			   return "OEMUnit";
+	case PLDM_OEM_STATE_SET_PDR:		   return "OEMStateSet";
+	case PLDM_NUMERIC_EFFECTER_PDR:		   return "NumericEffecter";
+	case PLDM_NUMERIC_EFFECTER_INITIALIZATION_PDR: return "NumericEffecterInit";
+	case PLDM_STATE_EFFECTER_PDR:		   return "StateEffecter";
+	case PLDM_STATE_EFFECTER_INITIALIZATION_PDR: return "StateEffecterInit";
+	case PLDM_EFFECTER_AUXILIARY_NAMES_PDR:	   return "EffecterAuxNames";
+	case PLDM_EFFECTER_OEM_SEMANTIC_PDR:	   return "EffecterOEMSemantic";
+	case PLDM_PDR_ENTITY_ASSOCIATION:	   return "EntityAssociation";
+	case PLDM_ENTITY_AUXILIARY_NAMES_PDR:	   return "EntityAuxNames";
+	case PLDM_OEM_ENTITY_ID_PDR:		   return "OEMEntityID";
+	case PLDM_INTERRUPT_ASSOCIATION_PDR:	   return "InterruptAssociation";
+	case PLDM_EVENT_LOG_PDR:		   return "EventLog";
+	case PLDM_PDR_FRU_RECORD_SET:		   return "FRURecordSet";
+	case PLDM_COMPACT_NUMERIC_SENSOR_PDR:	   return "CompactNumericSensor";
+	default:				   return "Unknown";
+	}
+}
+
+// Format the state_set_id of each composite entry in a state sensor/effecter
+// PDR's possible_states blob: [setId(2)][size(1)][states(size)] repeated.
+static void fmt_state_sets(char *out, size_t osz, const uint8_t *ps,
+			   const uint8_t *end, uint8_t count)
+{
+	size_t p = 0;
+	out[0] = 0;
+	for (uint8_t i = 0; i < count && ps + 3 <= end; i++) {
+		uint16_t sid = ps[0] | (ps[1] << 8);
+		uint8_t sz = ps[2];
+		p += snprintf(out + p, p < osz ? osz - p : 0, "%s%u", i ? "," : "",
+			      sid);
+		ps += 3 + sz;
+	}
+}
+
+// Decode and structurally validate one PDR record, printing its key fields.
+// Returns true if the record is sound: a known PDR type whose header length
+// field matches the bytes actually returned.
+static bool validate_pdr(struct results *r, const uint8_t *rec, size_t cnt)
+{
+	char det[176] = "";
+
+	if (cnt < sizeof(struct pldm_pdr_hdr)) {
+		check(r, "  PDR (truncated)", false, "only %zu bytes", cnt);
+		return false;
+	}
+	const struct pldm_pdr_hdr *h = (const struct pldm_pdr_hdr *)rec;
+	uint32_t handle = h->record_handle;
+	uint8_t type = h->type;
+	const char *name = pdr_type_name(type);
+	const uint8_t *end = rec + cnt;
+	// The header length field counts the bytes following the common header.
+	bool len_ok = (cnt == sizeof(struct pldm_pdr_hdr) + h->length);
+	bool known = strcmp(name, "Unknown") != 0;
+
+	switch (type) {
+	case PLDM_TERMINUS_LOCATOR_PDR: {
+		const struct pldm_terminus_locator_pdr *p = (const void *)rec;
+		uint8_t eid = (p->terminus_locator_type == 0 &&
+			       p->terminus_locator_value_size >= 1) ?
+				      p->terminus_locator_value[0] :
+				      0;
+		snprintf(det, sizeof(det),
+			 "validity=%u tid=%u container=%u loc_type=%u eid=%u",
+			 p->validity, p->tid, p->container_id,
+			 p->terminus_locator_type, eid);
+		break;
+	}
+	case PLDM_NUMERIC_SENSOR_PDR: {
+		struct pldm_numeric_sensor_value_pdr p = { 0 };
+		if (decode_numeric_sensor_pdr_data(rec, cnt, &p) == 0)
+			snprintf(det, sizeof(det),
+				 "sensor_id=%u entity_type=%u unit=%s mod=%d data_size=%u",
+				 p.sensor_id, p.entity_type,
+				 unit_name(p.base_unit), p.unit_modifier,
+				 p.sensor_data_size);
+		break;
+	}
+	case PLDM_STATE_SENSOR_PDR: {
+		const struct pldm_state_sensor_pdr *p = (const void *)rec;
+		char ss[80];
+		fmt_state_sets(ss, sizeof(ss), p->possible_states, end,
+			       p->composite_sensor_count);
+		snprintf(det, sizeof(det),
+			 "sensor_id=%u entity_type=%u composite=%u state_sets=[%s]",
+			 p->sensor_id, p->entity_type,
+			 p->composite_sensor_count, ss);
+		break;
+	}
+	case PLDM_STATE_EFFECTER_PDR: {
+		const struct pldm_state_effecter_pdr *p = (const void *)rec;
+		char ss[80];
+		fmt_state_sets(ss, sizeof(ss), p->possible_states, end,
+			       p->composite_effecter_count);
+		snprintf(det, sizeof(det),
+			 "effecter_id=%u entity_type=%u composite=%u state_sets=[%s]",
+			 p->effecter_id, p->entity_type,
+			 p->composite_effecter_count, ss);
+		break;
+	}
+	case PLDM_NUMERIC_EFFECTER_PDR: {
+		struct pldm_numeric_effecter_value_pdr p = { 0 };
+		if (decode_numeric_effecter_pdr_data(rec, cnt, &p) == 0)
+			snprintf(det, sizeof(det),
+				 "effecter_id=%u entity_type=%u unit=%s mod=%d",
+				 p.effecter_id, p.entity_type,
+				 unit_name(p.base_unit), p.unit_modifier);
+		break;
+	}
+	case PLDM_SENSOR_AUXILIARY_NAMES_PDR: {
+		const struct pldm_sensor_auxiliary_names_pdr *p =
+			(const void *)rec;
+		snprintf(det, sizeof(det), "sensor_id=%u name_count=%u",
+			 p->sensor_id, p->sensor_count);
+		break;
+	}
+	case PLDM_COMPACT_NUMERIC_SENSOR_PDR: {
+		const struct pldm_compact_numeric_sensor_pdr *p =
+			(const void *)rec;
+		snprintf(det, sizeof(det),
+			 "sensor_id=%u entity_type=%u unit=%s mod=%d",
+			 p->sensor_id, p->entity_type, unit_name(p->base_unit),
+			 p->unit_modifier);
+		break;
+	}
+	case PLDM_PDR_ENTITY_ASSOCIATION: {
+		// Body after the common header.
+		const struct pldm_pdr_entity_association *p =
+			(const void *)(rec + sizeof(struct pldm_pdr_hdr));
+		snprintf(det, sizeof(det),
+			 "container_id=%u assoc=%s container_entity=%u.%u children=%u",
+			 p->container_id,
+			 p->association_type == PLDM_ENTITY_ASSOCIAION_PHYSICAL ?
+				 "physical" :
+				 "logical",
+			 p->container.entity_type,
+			 p->container.entity_instance_num, p->num_children);
+		break;
+	}
+	case PLDM_PDR_FRU_RECORD_SET: {
+		const struct pldm_pdr_fru_record_set *p =
+			(const void *)(rec + sizeof(struct pldm_pdr_hdr));
+		snprintf(det, sizeof(det),
+			 "fru_rsi=%u entity_type=%u instance=%u container=%u",
+			 p->fru_rsi, p->entity_type, p->entity_instance_num,
+			 p->container_id);
+		break;
+	}
+	default:
+		snprintf(det, sizeof(det), "(not decoded)");
+		break;
+	}
+
+	printf("   PDR %u: %-21s v%u len=%u  %s\n", handle, name, h->version,
+	       h->length, det);
+	char nm[48];
+	snprintf(nm, sizeof(nm), "  PDR %u %s", handle, name);
+	check(r, nm, known && len_ok, "type=%u len_ok=%d", type, len_ok);
+	return known && len_ok;
+}
+
 static void pdr_walk(struct app_ctx *ctx, uint8_t eid, int to,
 		     struct inventory *inv, struct results *r)
 {
@@ -287,10 +458,8 @@ static void pdr_walk(struct app_ctx *ctx, uint8_t eid, int to,
 			printf("   note: handle %u is multipart (flag=0x%02x), "
 			       "only first part parsed\n",
 			       handle, flag);
-		const struct pldm_pdr_hdr *h = (const struct pldm_pdr_hdr *)recbuf;
-		printf("   PDR handle=%u type=%u len=%u\n", handle, h->type,
-		       cnt);
-		parse_pdr(inv, recbuf, cnt);
+		validate_pdr(r, recbuf, cnt); // decode + structurally validate
+		parse_pdr(inv, recbuf, cnt);  // collect sensors/effecters to read
 		seen++;
 		handle = next;
 	} while (handle != 0 && seen < 256);

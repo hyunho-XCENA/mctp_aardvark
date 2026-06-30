@@ -22,6 +22,10 @@
 
 #define PLDM_OUR_TID 0x01 // our terminus id when acting as a device
 
+// TID value the requester assigns to the DUT in the SetTID test (must be a
+// valid PLDM TID: 0x01..0xFE — 0x00/0xFF are reserved). Persists on the DUT.
+#define PLDM_SETTID_TEST_VALUE 3
+
 // A PLDM message on the wire = MCTP type byte (0x01) + struct pldm_msg
 // (3-byte header + payload). libpldm encodes into a struct pldm_msg, so we
 // place it at offset 1 and prepend the MCTP type byte ourselves.
@@ -111,6 +115,40 @@ static void pldm_discover(struct app_ctx *ctx, uint8_t eid, int to,
 	}
 	check(r, "PLDM GetTID", ok && cc == PLDM_SUCCESS, "cc=0x%02x tid=%u", cc,
 	      tid);
+
+	// SetTID test: assign a fixed test TID, then GetTID to confirm it stuck.
+	// NOTE: this CHANGES the DUT's PLDM terminus ID (here 0x00 unassigned ->
+	// PLDM_SETTID_TEST_VALUE) and can't be reverted to 0x00 (SetTID forbids
+	// the reserved values 0x00/0xff). The PLDM TID is independent of the MCTP
+	// EID, so this does not affect MCTP addressing in the other test modes.
+	if (ok && cc == PLDM_SUCCESS) {
+		const uint8_t want_tid = PLDM_SETTID_TEST_VALUE;
+		uint8_t scc = 0xff;
+		bool sok = encode_set_tid_req(pl_iid(ctx), want_tid, req) == 0 &&
+			   request_wait(ctx, eid, tx,
+					MCTP_PLDM_OVERHEAD + PLDM_SET_TID_REQ_BYTES,
+					MCTP_MSG_TYPE_PLDM, PLDM_SET_TID, to);
+		if (sok) {
+			rsp = pldm_resp(ctx, &pl);
+			scc = pl >= 1 ? rsp->payload[0] : 0xff;
+		}
+		uint8_t tcc = 0xff, tid2 = 0xff;
+		bool gok = encode_get_tid_req(pl_iid(ctx), req) == 0 &&
+			   request_wait(ctx, eid, tx,
+					MCTP_PLDM_OVERHEAD + PLDM_GET_TID_REQ_BYTES,
+					MCTP_MSG_TYPE_PLDM, PLDM_GET_TID, to);
+		if (gok) {
+			rsp = pldm_resp(ctx, &pl);
+			decode_get_tid_resp(rsp, pl, &tcc, &tid2);
+		}
+		check(r, "PLDM SetTID (assign + verify)",
+		      sok && scc == PLDM_SUCCESS && tid2 == want_tid,
+		      "set tid=%u, %s, reread=%u", want_tid,
+		      !sok		      ? "no response" :
+		      scc == PLDM_SUCCESS ? "cc=0x00" :
+					    "rejected",
+		      tid2);
+	}
 
 	// GetPLDMTypes — ask the DUT what it supports (no libpldm decode helper,
 	// so read the 8-byte type bitfield from the payload directly).
