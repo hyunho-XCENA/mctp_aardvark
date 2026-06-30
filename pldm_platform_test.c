@@ -961,3 +961,149 @@ void run_pldm_platform_bench(struct app_ctx *ctx, uint8_t dst_eid,
 		printf("\n(write round-trips skipped; pass -W to enable)\n");
 	}
 }
+
+// ===================================================================
+// Event polling: PollForPlatformEventMessage (0x0b). The DUT advertises it;
+// we poll the first part and report any queued event (event_id 0 = none).
+// Read-only: we poll with GetFirstPart and do not acknowledge (ack would
+// consume the event from the FD's queue).
+// ===================================================================
+void run_pldm_event_bench(struct app_ctx *ctx, uint8_t dst_eid, int timeout_ms,
+			  struct results *r)
+{
+	uint8_t tx[64];
+	struct pldm_msg *req = (struct pldm_msg *)(tx + 1);
+	size_t pl;
+	const struct pldm_msg *rsp;
+
+	printf("\n== PLDM event poll (PollForPlatformEventMessage 0x0b) ==\n");
+
+	tx[0] = MCTP_MSG_TYPE_PLDM;
+	uint8_t cc = 0xff, tid = 0, flag = 0, eclass = 0;
+	uint16_t event_id = 0xffff;
+	uint32_t next_handle = 0, edata_size = 0, checksum = 0;
+	void *edata = NULL;
+	bool ok = encode_poll_for_platform_event_message_req(
+			  pl_iid(ctx), 0x01, PLDM_GET_FIRSTPART, 0,
+			  PLDM_PLATFORM_EVENT_ID_NULL, req,
+			  PLDM_POLL_FOR_PLATFORM_EVENT_MESSAGE_REQ_BYTES) == 0 &&
+		  request_wait(
+			  ctx, dst_eid, tx,
+			  MCTP_PLDM_OVERHEAD +
+				  PLDM_POLL_FOR_PLATFORM_EVENT_MESSAGE_REQ_BYTES,
+			  MCTP_MSG_TYPE_PLDM,
+			  PLDM_POLL_FOR_PLATFORM_EVENT_MESSAGE, timeout_ms);
+	if (ok) {
+		rsp = pldm_resp(ctx, &pl);
+		ok = decode_poll_for_platform_event_message_resp(
+			     rsp, pl, &cc, &tid, &event_id, &next_handle, &flag,
+			     &eclass, &edata_size, &edata, &checksum) == 0;
+	}
+	check(r, "PLDM PollForPlatformEventMessage", ok && cc == PLDM_SUCCESS,
+	      "cc=0x%02x", cc);
+	if (ok && cc == PLDM_SUCCESS) {
+		if (event_id == PLDM_PLATFORM_EVENT_ID_NULL)
+			printf("   no events queued (event_id=0)\n");
+		else
+			printf("   event_id=0x%04x class=0x%02x tid=%u "
+			       "data_size=%u\n",
+			       event_id, eclass, tid, edata_size);
+	}
+}
+
+// ===================================================================
+// Multipart transfer: request a PDR with a small requestCount to force the FD
+// to split one record across GetFirstPart/GetNextPart chunks, then verify the
+// reassembled record matches a single-shot read of the same handle.
+// ===================================================================
+void run_pldm_multipart_bench(struct app_ctx *ctx, uint8_t dst_eid,
+			      int timeout_ms, struct results *r)
+{
+	uint8_t tx[64];
+	struct pldm_msg *req = (struct pldm_msg *)(tx + 1);
+	size_t pl;
+	const struct pldm_msg *rsp;
+	const uint32_t handle = 0; // 0 = first record in the repository
+	const uint16_t chunk = 16; // small enough to force several parts
+
+	printf("\n== PLDM multipart GetPDR (forced %u-byte chunks) ==\n", chunk);
+	tx[0] = MCTP_MSG_TYPE_PLDM;
+
+	// Reference: single-shot read of the record.
+	uint8_t ref[512];
+	uint8_t cc = 0xff, flag = 0, crc = 0;
+	uint32_t next_rec = 0, next_xfer = 0;
+	uint16_t rcnt = 0;
+	bool ok = encode_get_pdr_req(pl_iid(ctx), handle, 0, PLDM_GET_FIRSTPART,
+				     sizeof(ref), 0, req,
+				     PLDM_GET_PDR_REQ_BYTES) == 0 &&
+		  request_wait(ctx, dst_eid, tx,
+			       MCTP_PLDM_OVERHEAD + PLDM_GET_PDR_REQ_BYTES,
+			       MCTP_MSG_TYPE_PLDM, PLDM_GET_PDR, timeout_ms);
+	if (ok) {
+		rsp = pldm_resp(ctx, &pl);
+		ok = decode_get_pdr_resp(rsp, pl, &cc, &next_rec, &next_xfer,
+					 &flag, &rcnt, ref, sizeof(ref),
+					 &crc) == 0;
+	}
+	check(r, "  reference single-shot GetPDR", ok && cc == PLDM_SUCCESS,
+	      "cc=0x%02x len=%u flag=0x%02x", cc, rcnt, flag);
+	if (!(ok && cc == PLDM_SUCCESS))
+		return;
+	size_t ref_len = rcnt;
+
+	// Multipart: same record handle, walk the data-transfer-handle chain.
+	uint8_t asm_buf[512];
+	size_t total = 0;
+	uint32_t xfer = 0;
+	uint8_t op = PLDM_GET_FIRSTPART;
+	int parts = 0, walk_ok = 1;
+	for (parts = 0; parts < 64; parts++) {
+		uint8_t pcc = 0xff, pflag = 0, pcrc = 0;
+		uint32_t pnext_rec = 0, pnext_xfer = 0;
+		uint16_t pcnt = 0;
+		uint8_t part[512]; // big enough even if the DUT ignores chunk size
+		ok = encode_get_pdr_req(pl_iid(ctx), handle, xfer, op, chunk, 0,
+					req, PLDM_GET_PDR_REQ_BYTES) == 0 &&
+		     request_wait(ctx, dst_eid, tx,
+				  MCTP_PLDM_OVERHEAD + PLDM_GET_PDR_REQ_BYTES,
+				  MCTP_MSG_TYPE_PLDM, PLDM_GET_PDR, timeout_ms);
+		if (ok) {
+			rsp = pldm_resp(ctx, &pl);
+			ok = decode_get_pdr_resp(rsp, pl, &pcc, &pnext_rec,
+						 &pnext_xfer, &pflag, &pcnt,
+						 part, sizeof(part),
+						 &pcrc) == 0;
+		}
+		if (!(ok && pcc == PLDM_SUCCESS)) {
+			walk_ok = 0;
+			printf("   part %d failed: cc=0x%02x\n", parts, pcc);
+			break;
+		}
+		if (total + pcnt <= sizeof(asm_buf)) {
+			memcpy(asm_buf + total, part, pcnt);
+			total += pcnt;
+		}
+		// First part must be Start (or StartAndEnd if it all fit);
+		// continuations are Middle then End.
+		if (pflag == PLDM_END || pflag == PLDM_START_AND_END)
+			break;
+		xfer = pnext_xfer;
+		op = PLDM_GET_NEXTPART;
+	}
+
+	bool match = walk_ok && total == ref_len &&
+		     memcmp(asm_buf, ref, ref_len) == 0;
+	check(r, "  multipart reassembly matches", match,
+	      "%d part(s), %zu bytes (ref %zu)", parts + 1, total, ref_len);
+	if (match && parts == 0)
+		printf("   note: DUT returned the whole %zu-byte record in one "
+		       "part — it does not honor the %u-byte requestCount, so "
+		       "true multipart wasn't exercised (data integrity still "
+		       "verified)\n",
+		       ref_len, chunk);
+	else if (match)
+		printf("   multipart transfer reassembled correctly over %d "
+		       "parts\n",
+		       parts + 1);
+}

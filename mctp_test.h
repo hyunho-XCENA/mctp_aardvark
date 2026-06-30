@@ -117,9 +117,24 @@ void run_pldm_effecter_drive(struct app_ctx *ctx, uint8_t dst_eid,
 			     uint16_t effecter_id, uint8_t state, int timeout_ms,
 			     struct results *r);
 
+// Poll the DUT for queued platform events (PollForPlatformEventMessage 0x0b).
+void run_pldm_event_bench(struct app_ctx *ctx, uint8_t dst_eid, int timeout_ms,
+			  struct results *r);
+
+// Force a multipart GetPDR transfer (small requestCount) and verify the
+// reassembled record matches a single-shot read.
+void run_pldm_multipart_bench(struct app_ctx *ctx, uint8_t dst_eid,
+			      int timeout_ms, struct results *r);
+
 // ---- PLDM Firmware Update validator (implemented in pldm_fwup_test.c) ----
 // Read-only: acts as Update Agent and queries the DUT (Firmware Device) with
 // QueryDeviceIdentifiers + GetFirmwareParameters + GetStatus. Does NOT run an
 // actual update (no RequestUpdate/UpdateComponent/Activate).
 void run_pldm_fwup_bench(struct app_ctx *ctx, uint8_t dst_eid, int timeout_ms,
 			 struct results *r);
+
+// ---- PLDM negative/conformance validator (pldm_negative_test.c) ----
+// Sends malformed / out-of-range PLDM requests and checks the DUT rejects them
+// with the correct completion code (never cc=SUCCESS). Does not change the DUT.
+void run_pldm_negative_bench(struct app_ctx *ctx, uint8_t dst_eid,
+			     int timeout_ms, struct results *r);

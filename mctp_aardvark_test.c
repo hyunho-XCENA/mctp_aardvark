@@ -392,6 +392,48 @@ static void run_live_listen(struct app_ctx *ctx, int secs)
 }
 
 // ===================================================================
+// SOAK / latency: hammer the DUT with N round-trips (Get Endpoint ID) and
+// report drop count + min/avg/max latency. Checks bus stability over many
+// transactions.
+// ===================================================================
+static void run_soak(struct app_ctx *ctx, uint8_t dst_eid, int count,
+		     int timeout_ms, struct results *r)
+{
+	printf("\n== SOAK: %d Get-Endpoint-ID round-trips to EID %u ==\n", count,
+	       dst_eid);
+	uint64_t tmin = UINT64_MAX, tmax = 0, tsum = 0;
+	int ok_n = 0, fail_n = 0;
+	uint64_t t_start = now_ms(NULL);
+	for (int i = 0; i < count; i++) {
+		uint64_t t0 = now_ms(NULL);
+		bool ok = master_request(ctx, dst_eid, MCTP_CTRL_CMD_GET_EID,
+					 NULL, 0, timeout_ms);
+		uint64_t dt = now_ms(NULL) - t0;
+		if (ok) {
+			ok_n++;
+			tsum += dt;
+			if (dt < tmin)
+				tmin = dt;
+			if (dt > tmax)
+				tmax = dt;
+		} else {
+			fail_n++;
+		}
+	}
+	uint64_t wall = now_ms(NULL) - t_start;
+	double avg = ok_n ? (double)tsum / ok_n : 0.0;
+	double avg_wall = count ? (double)wall / count : 0.0;
+	if (tmin == UINT64_MAX)
+		tmin = 0;
+	printf("   latency ms: min=%llu max=%llu avg=%.2f (per-req ms granular); "
+	       "wall avg=%.2f ms/req over %llu ms\n",
+	       (unsigned long long)tmin, (unsigned long long)tmax, avg, avg_wall,
+	       (unsigned long long)wall);
+	check(r, "SOAK no drops", fail_n == 0, "%d ok, %d dropped of %d", ok_n,
+	      fail_n, count);
+}
+
+// ===================================================================
 // AUTO-DISCOVERY (OpenBMC mctpd-style enumeration)
 //
 // As the bus owner we address an as-yet-unknown endpoint by its physical I2C
@@ -899,6 +941,10 @@ static void usage(const char *prog)
 		"  -W        with -T, also round-trip the Set* write commands\n"
 		"  -O        OpenBMC mctpd-style enrollment: enroll endpoint(s) + routing table\n"
 		"  -U        PLDM Firmware Update validator (read-only: identifiers/params/status)\n"
+		"  -N        PLDM negative/conformance: DUT must reject bad input with errors\n"
+		"  -V        PLDM event poll (PollForPlatformEventMessage 0x0b)\n"
+		"  -M        PLDM multipart GetPDR transfer + reassembly check\n"
+		"  -B N      soak: N Get-Endpoint-ID round-trips, report drops + latency\n"
 		"  -D id:st  drive state effecter <id> to state <st> (e.g. -D 5:2; changes DUT)\n"
 		"  -L secs   also LIVE-listen for DUT requests\n"
 		"  -i        interactive shell (no validator)\n"
@@ -914,11 +960,13 @@ int main(int argc, char **argv)
 	int power = 0, pullup = 0, verbose = 0, pec = 0;
 	int only_master = 0, only_slave = 0, interactive = 0, live = 0;
 	int discover = 0, scan = 0, assign_eid = 0, pldm = 0;
-	int platform = 0, allow_writes = 0, enroll = 0, fwup = 0;
+	int platform = 0, allow_writes = 0, enroll = 0, fwup = 0, negative = 0;
 	int drive = 0, drive_eff = 0, drive_state = 0;
+	int event = 0, multipart = 0, soak = 0;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "p:b:s:e:d:E:t:L:x:D:CuPmSARGTWOUivh")) != -1) {
+	while ((opt = getopt(argc, argv,
+			     "p:b:s:e:d:E:t:L:x:D:B:CuPmSARGTWOUNVMivh")) != -1) {
 		switch (opt) {
 		case 'p': port = (int)strtol(optarg, NULL, 0); break;
 		case 'b': bitrate = (int)strtol(optarg, NULL, 0); break;
@@ -941,6 +989,10 @@ int main(int argc, char **argv)
 		case 'W': allow_writes = 1; break;
 		case 'O': enroll = 1; break;
 		case 'U': fwup = 1; break;
+		case 'N': negative = 1; break;
+		case 'V': event = 1; break;
+		case 'M': multipart = 1; break;
+		case 'B': soak = (int)strtol(optarg, NULL, 0); break;
 		case 'D': {
 			// -D id:state  (decimal or 0x.. hex), e.g. -D 5:2
 			char *colon = strchr(optarg, ':');
@@ -1020,6 +1072,7 @@ int main(int argc, char **argv)
 	// Enrollment does its own NULL-EID probing (and scans the whole bus
 	// when no -d is given), so it resolves its own targets.
 	bool need_target = interactive || pldm || platform || drive || fwup ||
+			   negative || event || multipart || soak > 0 ||
 			   (!discover && !enroll && !only_slave);
 	if (need_target) {
 		if (dst_addr < 0) {
@@ -1076,6 +1129,16 @@ int main(int argc, char **argv)
 						&r);
 		} else if (fwup) {
 			run_pldm_fwup_bench(&ctx, (uint8_t)dst_eid, timeout, &r);
+		} else if (negative) {
+			run_pldm_negative_bench(&ctx, (uint8_t)dst_eid, timeout,
+						&r);
+		} else if (event) {
+			run_pldm_event_bench(&ctx, (uint8_t)dst_eid, timeout, &r);
+		} else if (multipart) {
+			run_pldm_multipart_bench(&ctx, (uint8_t)dst_eid, timeout,
+						 &r);
+		} else if (soak > 0) {
+			run_soak(&ctx, (uint8_t)dst_eid, soak, timeout, &r);
 		} else {
 			if (!only_slave)
 				run_master_tests(&ctx, (uint8_t)dst_eid,
