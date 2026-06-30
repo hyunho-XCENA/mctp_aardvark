@@ -25,6 +25,9 @@
 #define MCTP_CTRL_CMD_GET_UUID	  0x03
 #define MCTP_CTRL_CMD_GET_VERSION 0x04
 #define MCTP_CTRL_CMD_GET_TYPES	  0x05
+#define MCTP_CTRL_CMD_GET_VENDOR  0x06 // Get Vendor Defined Message Support
+#define MCTP_CTRL_CC_SUCCESS	  0x00
+#define MCTP_CTRL_CC_UNSUPPORTED  0x05 // ERROR_UNSUPPORTED_CMD
 #define EXPECT_NONE		  0xff
 
 #define MCTP_EID_NULL_LOCAL 0x00 // NULL destination EID, used for discovery
@@ -97,3 +100,19 @@ void pldm_handle_request(struct app_ctx *ctx, uint8_t src_eid, uint8_t msg_tag,
 // Full PLDM bench: discover the DUT (requester) + responder self-tests.
 void run_pldm_bench(struct app_ctx *ctx, uint8_t dst_eid, int timeout_ms,
 		    struct results *r);
+
+// ---- PLDM Platform validator (implemented in pldm_platform_test.c) ----
+// Walk the DUT's PDR repository and read every sensor/effecter it advertises
+// (GetPDRRepositoryInfo/GetPDR + GetSensorReading/GetStateSensorReadings/
+// GetSensorThresholds/GetStateEffecterStates). When allow_writes is set, also
+// round-trip the write commands (Set*) by writing back the value just read, so
+// the DUT's live state is preserved.
+void run_pldm_platform_bench(struct app_ctx *ctx, uint8_t dst_eid,
+			     int timeout_ms, int allow_writes,
+			     struct results *r);
+
+// Actively drive one state effecter to a given state (changes the DUT, e.g. to
+// turn an LED on/off). Reads the effecter state before and after to confirm.
+void run_pldm_effecter_drive(struct app_ctx *ctx, uint8_t dst_eid,
+			     uint16_t effecter_id, uint8_t state, int timeout_ms,
+			     struct results *r);

@@ -186,6 +186,91 @@ static void pldm_discover(struct app_ctx *ctx, uint8_t eid, int to,
 	}
 }
 
+static const char *fru_field_name(uint8_t t)
+{
+	switch (t) {
+	case PLDM_FRU_FIELD_TYPE_CHASSIS:      return "ChassisType";
+	case PLDM_FRU_FIELD_TYPE_MODEL:	       return "Model";
+	case PLDM_FRU_FIELD_TYPE_PN:	       return "PartNumber";
+	case PLDM_FRU_FIELD_TYPE_SN:	       return "SerialNumber";
+	case PLDM_FRU_FIELD_TYPE_MANUFAC:      return "Manufacturer";
+	case PLDM_FRU_FIELD_TYPE_MANUFAC_DATE: return "ManufactureDate";
+	case PLDM_FRU_FIELD_TYPE_VENDOR:       return "Vendor";
+	case PLDM_FRU_FIELD_TYPE_NAME:	       return "Name";
+	case PLDM_FRU_FIELD_TYPE_SKU:	       return "SKU";
+	case PLDM_FRU_FIELD_TYPE_VERSION:      return "Version";
+	case PLDM_FRU_FIELD_TYPE_ASSET_TAG:    return "AssetTag";
+	case PLDM_FRU_FIELD_TYPE_DESC:	       return "Description";
+	case PLDM_FRU_FIELD_TYPE_EC_LVL:       return "ECLevel";
+	case PLDM_FRU_FIELD_TYPE_OTHER:	       return "Other";
+	case PLDM_FRU_FIELD_TYPE_IANA:	       return "VendorIANA";
+	default:			       return "Field";
+	}
+}
+
+// Print a FRU field value: ASCII/UTF-8 verbatim, IANA as a number, else hex.
+static void fru_print_value(uint8_t ftype, uint8_t enc, const uint8_t *v,
+			    uint8_t len)
+{
+	bool ascii = (enc == PLDM_FRU_ENCODING_ASCII ||
+		      enc == PLDM_FRU_ENCODING_UTF8);
+	for (uint8_t i = 0; ascii && i < len; i++)
+		if (v[i] < 0x20 || v[i] > 0x7e)
+			ascii = false;
+
+	if (ftype == PLDM_FRU_FIELD_TYPE_IANA && len == 4) {
+		uint32_t iana = v[0] | (v[1] << 8) | (v[2] << 16) |
+				((uint32_t)v[3] << 24);
+		printf("%u (0x%08x)", iana, iana);
+	} else if (ascii) {
+		printf("%.*s", len, v);
+	} else {
+		for (uint8_t i = 0; i < len; i++)
+			printf("%02x", v[i]);
+	}
+}
+
+// Walk a raw FRU record table and decode each record's fields (DSP0257).
+// Layout per record: setId(2) recordType(1) numFields(1) encoding(1), then
+// numFields TLVs of [fieldType(1)][length(1)][value(length)].
+static void fru_parse_table(struct results *r, const uint8_t *tbl, size_t len)
+{
+	size_t off = 0;
+	int records = 0, fields = 0;
+
+	while (off + 5 <= len) {
+		uint16_t set_id = tbl[off] | (tbl[off + 1] << 8);
+		uint8_t rtype = tbl[off + 2];
+		uint8_t nfields = tbl[off + 3];
+		uint8_t enc = tbl[off + 4];
+		if (rtype != PLDM_FRU_RECORD_TYPE_GENERAL &&
+		    rtype != PLDM_FRU_RECORD_TYPE_OEM)
+			break; // not a record header — likely padding/CRC tail
+		off += 5;
+
+		printf("   record %d: set_id=0x%04x type=%s encoding=%u\n",
+		       records,
+		       set_id, rtype == PLDM_FRU_RECORD_TYPE_OEM ? "OEM" :
+								   "General",
+		       enc);
+		for (uint8_t f = 0; f < nfields && off + 2 <= len; f++) {
+			uint8_t ft = tbl[off];
+			uint8_t fl = tbl[off + 1];
+			off += 2;
+			if (off + fl > len)
+				break;
+			printf("      %-16s: ", fru_field_name(ft));
+			fru_print_value(ft, enc, tbl + off, fl);
+			printf("\n");
+			off += fl;
+			fields++;
+		}
+		records++;
+	}
+	check(r, "PLDM FRU parsed", records > 0, "%d record(s), %d field(s)",
+	      records, fields);
+}
+
 // Read the DUT's FRU record table (FRU type 0x04) using libpldm.
 static void pldm_fru(struct app_ctx *ctx, uint8_t eid, int to,
 		     struct results *r)
@@ -241,8 +326,13 @@ static void pldm_fru(struct app_ctx *ctx, uint8_t eid, int to,
 	}
 	check(r, "PLDM FRU RecordTable", ok && cc == PLDM_SUCCESS,
 	      "cc=0x%02x got %zu bytes", cc, tbllen);
-	if (ok && cc == PLDM_SUCCESS && ctx->verbose)
+	if (!(ok && cc == PLDM_SUCCESS))
+		return;
+	if (ctx->verbose)
 		hexdump("   FRU table", tbl, tbllen);
+
+	// Decode the record table into human-readable fields.
+	fru_parse_table(r, tbl, tbllen);
 }
 
 // ===================================================================

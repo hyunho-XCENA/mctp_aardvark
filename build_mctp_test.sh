@@ -15,6 +15,7 @@ PLDM_BUILD="$PLDM/build-meson"
 gcc -Wall -Wextra -O2 -DI2C_BTU=254 \
     "$ROOT/mctp_aardvark_test.c" \
     "$ROOT/pldm_test.c" \
+    "$ROOT/pldm_platform_test.c" \
     "$AA/aardvark.c" \
     -I"$AA" -I"$MCTP" -I"$MCTP_BUILD" \
     -I"$PLDM/include" -I"$PLDM_BUILD/include" \

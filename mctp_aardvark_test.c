@@ -569,6 +569,264 @@ static void run_discovery(struct app_ctx *ctx, uint8_t peer_addr, int scan,
 }
 
 // ===================================================================
+// OpenBMC mctpd-style enrollment validator.
+//
+// A bus owner enrolls every endpoint it finds on the bus by running a fixed
+// control-message state machine, then keeps a routing table mapping EID <->
+// physical address. mctpd keys that table by the endpoint UUID so a device
+// keeps its EID across reboots; we mirror that here:
+//
+//   1. Get Endpoint ID        (NULL-EID physical addressing) -> current EID/type
+//   2. Get Endpoint UUID      -> stable key for EID reuse
+//   3. Set Endpoint ID        -> assign an EID (reuse UUID's / current, else pool)
+//   4. Get MCTP Version Support (base spec + control protocol)
+//   5. Get Message Type Support -> which protocols the endpoint speaks
+//   6. Get Vendor Defined Message Support -> vendor/OEM message sets
+//
+// Each step is a PASS/FAIL check; the routing table is printed at the end.
+// ===================================================================
+#define ENROLL_MAX    16
+#define EID_POOL_BASE 0x09 // dynamic-EID pool start (0x00-0x07 reserved, 0x08 = us)
+
+struct enroll_entry {
+	uint8_t phys;
+	uint8_t eid;
+	uint8_t ep_type; // raw Endpoint-Type byte from Get Endpoint ID
+	bool has_uuid;
+	uint8_t uuid[16];
+	uint8_t types[16];
+	int n_types;
+};
+
+struct enroll_table {
+	struct enroll_entry e[ENROLL_MAX];
+	int n;
+	uint8_t pool_next;
+};
+
+// Find a previously-enrolled endpoint by UUID; return its EID, or 0 if new.
+static uint8_t enroll_eid_for_uuid(struct enroll_table *t, const uint8_t *uuid)
+{
+	for (int i = 0; i < t->n; i++)
+		if (t->e[i].has_uuid && !memcmp(t->e[i].uuid, uuid, 16))
+			return t->e[i].eid;
+	return 0;
+}
+
+static void uuid_str(char *out, size_t osz, const uint8_t *u)
+{
+	snprintf(out, osz,
+		 "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		 u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9],
+		 u[10], u[11], u[12], u[13], u[14], u[15]);
+}
+
+// Enroll one endpoint at physical address `phys`. Returns true if an endpoint
+// answered (and was enrolled), false if the address is empty.
+static bool enroll_one(struct app_ctx *ctx, uint8_t phys, int force_eid, int to,
+		       struct enroll_table *tbl, struct results *r)
+{
+	char tag[40];
+
+	// 1. Get Endpoint ID via NULL-EID physical addressing.
+	neigh_set_raw(ctx->i2c, MCTP_EID_NULL_LOCAL, phys);
+	if (!master_request(ctx, MCTP_EID_NULL_LOCAL, MCTP_CTRL_CMD_GET_EID,
+			    NULL, 0, to))
+		return false; // nobody home
+	uint8_t cc = ctx->resp_len >= 4 ? ctx->resp_buf[3] : 0xff;
+	uint8_t cur_eid = ctx->resp_len >= 5 ? ctx->resp_buf[4] : 0;
+	uint8_t ep_type = ctx->resp_len >= 6 ? ctx->resp_buf[5] : 0;
+	snprintf(tag, sizeof(tag), "[0x%02x] Get Endpoint ID", phys);
+	check(r, tag, cc == 0 && ctx->resp_len >= 5,
+	      "cc=0x%02x eid=0x%02x type=0x%02x", cc, cur_eid, ep_type);
+
+	// Route subsequent requests via the current EID if it has a usable one.
+	uint8_t route = cur_eid >= 8 ? cur_eid : MCTP_EID_NULL_LOCAL;
+	if (cur_eid >= 8)
+		neigh_set_raw(ctx->i2c, cur_eid, phys);
+
+	// 2. Get Endpoint UUID (stable key for EID reuse).
+	uint8_t uuid[16] = { 0 };
+	bool has_uuid = false;
+	bool ok = master_request(ctx, route, MCTP_CTRL_CMD_GET_UUID, NULL, 0, to);
+	cc = ok && ctx->resp_len >= 4 ? ctx->resp_buf[3] : 0xff;
+	if (ok && cc == 0 && ctx->resp_len >= 4 + 16) {
+		memcpy(uuid, ctx->resp_buf + 4, 16);
+		has_uuid = true;
+	}
+	snprintf(tag, sizeof(tag), "[0x%02x] Get Endpoint UUID", phys);
+	char ub[40] = "n/a";
+	if (has_uuid)
+		uuid_str(ub, sizeof(ub), uuid);
+	// Get Endpoint UUID is optional in DSP0236; a clean "unsupported"
+	// reply is spec-legal, so only a timeout/garbled reply is a failure.
+	check(r, tag,
+	      ok && (cc == MCTP_CTRL_CC_SUCCESS || cc == MCTP_CTRL_CC_UNSUPPORTED),
+	      "%scc=0x%02x uuid=%s",
+	      cc == MCTP_CTRL_CC_UNSUPPORTED ? "unsupported, " : "", cc, ub);
+
+	// 3. Decide which EID to assign, then Set Endpoint ID.
+	//    Priority: -x override > UUID seen before > keep current > pool.
+	uint8_t reuse = has_uuid ? enroll_eid_for_uuid(tbl, uuid) : 0;
+	uint8_t want = force_eid > 0	     ? (uint8_t)force_eid :
+		       reuse		     ? reuse :
+		       cur_eid >= 8	     ? cur_eid :
+					       tbl->pool_next++;
+	uint8_t body[2] = { 0x00, want }; // operation 0 = Set EID
+	ok = master_request(ctx, route, MCTP_CTRL_CMD_SET_EID, body, 2, to);
+	cc = ok && ctx->resp_len >= 4 ? ctx->resp_buf[3] : 0xff;
+	uint8_t assigned = ok && ctx->resp_len >= 6 ? ctx->resp_buf[5] : want;
+	snprintf(tag, sizeof(tag), "[0x%02x] Set Endpoint ID", phys);
+	check(r, tag, ok && cc == 0, "assigned eid=0x%02x cc=0x%02x%s", assigned,
+	      cc, reuse ? " (reused via UUID)" : "");
+	uint8_t final_eid = (ok && cc == 0) ? assigned : cur_eid;
+	if (final_eid >= 8)
+		neigh_set_raw(ctx->i2c, final_eid, phys);
+	route = final_eid >= 8 ? final_eid : MCTP_EID_NULL_LOCAL;
+
+	// 4. Get MCTP Version Support for the base spec (0xff) and the control
+	//    protocol message type (0x00).
+	uint8_t vq[2] = { 0xff, 0x00 };
+	const char *vn[2] = { "base-spec", "control" };
+	for (int i = 0; i < 2; i++) {
+		ok = master_request(ctx, route, MCTP_CTRL_CMD_GET_VERSION,
+				    &vq[i], 1, to);
+		cc = ok && ctx->resp_len >= 4 ? ctx->resp_buf[3] : 0xff;
+		snprintf(tag, sizeof(tag), "[0x%02x] Get MCTP Version (%s)",
+			 phys, vn[i]);
+		check(r, tag, ok && cc == 0, "cc=0x%02x", cc);
+	}
+
+	// 5. Get Message Type Support.
+	uint8_t types[16];
+	int n_types = 0;
+	ok = master_request(ctx, route, MCTP_CTRL_CMD_GET_TYPES, NULL, 0, to);
+	cc = ok && ctx->resp_len >= 4 ? ctx->resp_buf[3] : 0xff;
+	char tbuf[80] = "";
+	if (ok && cc == 0 && ctx->resp_len >= 5) {
+		uint8_t cnt = ctx->resp_buf[4];
+		size_t p = 0;
+		for (uint8_t i = 0; i < cnt && (size_t)(5 + i) < ctx->resp_len &&
+				    n_types < 16;
+		     i++) {
+			types[n_types++] = ctx->resp_buf[5 + i];
+			p += snprintf(tbuf + p, p < sizeof(tbuf) ?
+						       sizeof(tbuf) - p :
+						       0,
+				      "%s0x%02x", i ? "," : "",
+				      ctx->resp_buf[5 + i]);
+		}
+	}
+	snprintf(tag, sizeof(tag), "[0x%02x] Get Message Type Support", phys);
+	check(r, tag, ok && cc == 0, "cc=0x%02x types=[%s]", cc, tbuf);
+
+	// 6. Get Vendor Defined Message Support (walk the selector chain).
+	uint8_t sel = 0x00;
+	int vendors = 0;
+	uint8_t vcc = 0xff;
+	for (int guard = 0; guard < 8; guard++) {
+		ok = master_request(ctx, route, MCTP_CTRL_CMD_GET_VENDOR, &sel,
+				    1, to);
+		vcc = ok && ctx->resp_len >= 4 ? ctx->resp_buf[3] : 0xff;
+		if (!(ok && vcc == MCTP_CTRL_CC_SUCCESS))
+			break;
+		vendors++;
+		uint8_t next = ctx->resp_len >= 5 ? ctx->resp_buf[4] : 0xff;
+		if (next == 0xff)
+			break; // 0xff = no more vendor sets
+		sel = next;
+	}
+	// Optional: an endpoint with no vendor-defined message types cleanly
+	// replies "unsupported". Treat success or a clean unsupported as a pass.
+	snprintf(tag, sizeof(tag), "[0x%02x] Get Vendor Defined Msg Support",
+		 phys);
+	check(r, tag,
+	      vcc == MCTP_CTRL_CC_SUCCESS || vcc == MCTP_CTRL_CC_UNSUPPORTED,
+	      "%scc=0x%02x vendor_sets=%d",
+	      vcc == MCTP_CTRL_CC_UNSUPPORTED ? "unsupported, " : "", vcc,
+	      vendors);
+
+	// Record / update the routing-table entry.
+	struct enroll_entry *slot = NULL;
+	for (int i = 0; i < tbl->n; i++)
+		if (tbl->e[i].phys == phys) {
+			slot = &tbl->e[i];
+			break;
+		}
+	if (!slot && tbl->n < ENROLL_MAX)
+		slot = &tbl->e[tbl->n++];
+	if (slot) {
+		slot->phys = phys;
+		slot->eid = final_eid;
+		slot->ep_type = ep_type;
+		slot->has_uuid = has_uuid;
+		memcpy(slot->uuid, uuid, 16);
+		memcpy(slot->types, types, n_types);
+		slot->n_types = n_types;
+	}
+	return true;
+}
+
+static void run_openbmc_enroll(struct app_ctx *ctx, int peer_addr,
+			       int force_eid, int timeout_ms, struct results *r)
+{
+	printf("\n== OpenBMC mctpd-style enrollment ==\n");
+	struct enroll_table tbl = { .pool_next = EID_POOL_BASE };
+
+	if (peer_addr >= 0) {
+		// Enroll a single, known endpoint.
+		if (!enroll_one(ctx, (uint8_t)peer_addr, force_eid, timeout_ms,
+				&tbl, r))
+			check(r, "enrollment target present", false,
+			      "no endpoint at 0x%02x", peer_addr);
+	} else {
+		// Bus owner behaviour: scan the bus and enroll everyone.
+		printf("Scanning I2C addresses 0x08..0x77 and enrolling ...\n");
+		int to = timeout_ms < 200 ? timeout_ms : 200;
+		ctx->quiet = 1; // silence expected NACKs on empty addresses
+		for (uint8_t a = 0x08; a <= 0x77; a++) {
+			if (a == ctx->own_addr)
+				continue;
+			// Quick probe first so per-address checks aren't logged
+			// for empty slots.
+			neigh_set_raw(ctx->i2c, MCTP_EID_NULL_LOCAL, a);
+			bool present = master_request(ctx, MCTP_EID_NULL_LOCAL,
+						      MCTP_CTRL_CMD_GET_EID,
+						      NULL, 0, to);
+			if (!present)
+				continue;
+			ctx->quiet = 0;
+			enroll_one(ctx, a, force_eid, timeout_ms, &tbl, r);
+			ctx->quiet = 1;
+		}
+		ctx->quiet = 0;
+	}
+
+	// Print the resulting routing table.
+	printf("\n-- routing table (%d endpoint%s) --\n", tbl.n,
+	       tbl.n == 1 ? "" : "s");
+	printf("  EID   addr  endpoint-type  msg-types            UUID\n");
+	for (int i = 0; i < tbl.n; i++) {
+		struct enroll_entry *e = &tbl.e[i];
+		const char *kind = (e->ep_type & 0x10) ? "bridge" : "simple";
+		const char *eidtype = (e->ep_type & 0x03) == 0x01 ? "static" :
+								    "dynamic";
+		char tbuf[40] = "";
+		size_t p = 0;
+		for (int t = 0; t < e->n_types; t++)
+			p += snprintf(tbuf + p, p < sizeof(tbuf) ?
+						       sizeof(tbuf) - p :
+						       0,
+				      "%s0x%02x", t ? "," : "", e->types[t]);
+		char ub[40] = "n/a";
+		if (e->has_uuid)
+			uuid_str(ub, sizeof(ub), e->uuid);
+		printf("  0x%02x  0x%02x  %-6s/%-7s %-20s %s\n", e->eid, e->phys,
+		       kind, eidtype, tbuf, ub);
+	}
+}
+
+// ===================================================================
 // Interactive shell (-i)
 // ===================================================================
 static void handle_line(struct app_ctx *ctx, char *line, uint8_t dflt_eid)
@@ -637,6 +895,10 @@ static void usage(const char *prog)
 		"  -R        scan the whole I2C bus (0x08..0x77) for endpoints\n"
 		"  -x eid    assign this EID during discovery (Set Endpoint ID)\n"
 		"  -G        PLDM bench: discover DUT's PLDM + responder self-tests\n"
+		"  -T        PLDM Platform validator: walk PDRs + read sensors/effecters\n"
+		"  -W        with -T, also round-trip the Set* write commands\n"
+		"  -O        OpenBMC mctpd-style enrollment: enroll endpoint(s) + routing table\n"
+		"  -D id:st  drive state effecter <id> to state <st> (e.g. -D 5:2; changes DUT)\n"
 		"  -L secs   also LIVE-listen for DUT requests\n"
 		"  -i        interactive shell (no validator)\n"
 		"  -v        verbose (wire dumps + libmctp debug)\n",
@@ -651,9 +913,11 @@ int main(int argc, char **argv)
 	int power = 0, pullup = 0, verbose = 0, pec = 0;
 	int only_master = 0, only_slave = 0, interactive = 0, live = 0;
 	int discover = 0, scan = 0, assign_eid = 0, pldm = 0;
+	int platform = 0, allow_writes = 0, enroll = 0;
+	int drive = 0, drive_eff = 0, drive_state = 0;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "p:b:s:e:d:E:t:L:x:CuPmSARGivh")) != -1) {
+	while ((opt = getopt(argc, argv, "p:b:s:e:d:E:t:L:x:D:CuPmSARGTWOivh")) != -1) {
 		switch (opt) {
 		case 'p': port = (int)strtol(optarg, NULL, 0); break;
 		case 'b': bitrate = (int)strtol(optarg, NULL, 0); break;
@@ -672,6 +936,21 @@ int main(int argc, char **argv)
 		case 'R': discover = 1; scan = 1; break;
 		case 'x': assign_eid = (int)strtol(optarg, NULL, 0); break;
 		case 'G': pldm = 1; break;
+		case 'T': platform = 1; break;
+		case 'W': allow_writes = 1; break;
+		case 'O': enroll = 1; break;
+		case 'D': {
+			// -D id:state  (decimal or 0x.. hex), e.g. -D 5:2
+			char *colon = strchr(optarg, ':');
+			if (!colon) {
+				fprintf(stderr, "-D needs id:state (e.g. -D 5:2)\n");
+				return 1;
+			}
+			drive = 1;
+			drive_eff = (int)strtol(optarg, NULL, 0);
+			drive_state = (int)strtol(colon + 1, NULL, 0);
+			break;
+		}
 		case 'i': interactive = 1; break;
 		case 'v': verbose = 1; break;
 		default: usage(argv[0]); return 1;
@@ -736,7 +1015,10 @@ int main(int argc, char **argv)
 		scan = 1;
 
 	// Modes that send requests to a specific EID need a concrete target.
-	bool need_target = interactive || pldm || (!discover && !only_slave);
+	// Enrollment does its own NULL-EID probing (and scans the whole bus
+	// when no -d is given), so it resolves its own targets.
+	bool need_target = interactive || pldm || platform || drive ||
+			   (!discover && !enroll && !only_slave);
 	if (need_target) {
 		if (dst_addr < 0) {
 			uint8_t fa = 0, fe = 0;
@@ -779,6 +1061,17 @@ int main(int argc, char **argv)
 				      timeout, &r);
 		} else if (pldm) {
 			run_pldm_bench(&ctx, (uint8_t)dst_eid, timeout, &r);
+		} else if (platform) {
+			run_pldm_platform_bench(&ctx, (uint8_t)dst_eid, timeout,
+						allow_writes, &r);
+		} else if (enroll) {
+			run_openbmc_enroll(&ctx, dst_addr, assign_eid, timeout,
+					   &r);
+		} else if (drive) {
+			run_pldm_effecter_drive(&ctx, (uint8_t)dst_eid,
+						(uint16_t)drive_eff,
+						(uint8_t)drive_state, timeout,
+						&r);
 		} else {
 			if (!only_slave)
 				run_master_tests(&ctx, (uint8_t)dst_eid,
