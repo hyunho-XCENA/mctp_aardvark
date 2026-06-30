@@ -156,7 +156,12 @@ static void rx_all(uint8_t src_eid, bool tag_owner, uint8_t msg_tag, void *vctx,
 	// PLDM request addressed to us -> respond like a PLDM device.
 	// (MCTP control requests are auto-handled by libmctp, not delivered here.)
 	if (len >= 4 && m[0] == MCTP_MSG_TYPE_PLDM && (m[1] & PLDM_RQ)) {
-		pldm_handle_request(ctx, src_eid, msg_tag, m, len);
+		// During a firmware update the FD drives the transfer, sending
+		// PLDM FW-update requests to us; route those to the session.
+		if (ctx->fwup && (m[2] & 0x3f) == PLDM_TYPE_FWUP)
+			fwup_handle_request(ctx, src_eid, msg_tag, m, len);
+		else
+			pldm_handle_request(ctx, src_eid, msg_tag, m, len);
 		return;
 	}
 
@@ -204,6 +209,14 @@ static void pump_rx(struct app_ctx *ctx, int timeout_ms)
 	}
 	if (r & AA_ASYNC_I2C_WRITE)
 		aa_i2c_slave_write_stats(ctx->aa);
+}
+
+// Pump rx + tx once. Exposed so the firmware-update transfer phase (driven by
+// FD-initiated requests) can spin the MCTP machinery (see mctp_test.h).
+void mctp_pump(struct app_ctx *ctx, int timeout_ms)
+{
+	pump_rx(ctx, timeout_ms);
+	mctp_i2c_tx_poll(ctx->i2c);
 }
 
 // Send a complete MCTP message and wait for a matching response. Shared by the
@@ -996,6 +1009,7 @@ static void usage(const char *prog)
 		"  -M        PLDM multipart GetPDR transfer + reassembly check\n"
 		"  -B N      soak: N Get-Endpoint-ID round-trips, report drops + latency\n"
 		"  -Y        PEC enforcement: DUT must drop a request with a bad SMBus PEC (needs -C)\n"
+		"  -F pkg    flash a PLDM firmware package to the DUT (WRITES firmware!)\n"
 		"  -D id:st  drive state effecter <id> to state <st> (e.g. -D 5:2; changes DUT)\n"
 		"  -L secs   also LIVE-listen for DUT requests\n"
 		"  -i        interactive shell (no validator)\n"
@@ -1014,10 +1028,11 @@ int main(int argc, char **argv)
 	int platform = 0, allow_writes = 0, enroll = 0, fwup = 0, negative = 0;
 	int drive = 0, drive_eff = 0, drive_state = 0;
 	int event = 0, multipart = 0, soak = 0, pectest = 0;
+	const char *fwpkg = NULL;
 	int opt;
 
 	while ((opt = getopt(argc, argv,
-			     "p:b:s:e:d:E:t:L:x:D:B:CuPmSARGTWOUNVMYivh")) != -1) {
+			     "p:b:s:e:d:E:t:L:x:D:B:F:CuPmSARGTWOUNVMYivh")) != -1) {
 		switch (opt) {
 		case 'p': port = (int)strtol(optarg, NULL, 0); break;
 		case 'b': bitrate = (int)strtol(optarg, NULL, 0); break;
@@ -1045,6 +1060,7 @@ int main(int argc, char **argv)
 		case 'M': multipart = 1; break;
 		case 'B': soak = (int)strtol(optarg, NULL, 0); break;
 		case 'Y': pectest = 1; break;
+		case 'F': fwpkg = optarg; break;
 		case 'D': {
 			// -D id:state  (decimal or 0x.. hex), e.g. -D 5:2
 			char *colon = strchr(optarg, ':');
@@ -1125,7 +1141,7 @@ int main(int argc, char **argv)
 	// when no -d is given), so it resolves its own targets.
 	bool need_target = interactive || pldm || platform || drive || fwup ||
 			   negative || event || multipart || soak > 0 || pectest ||
-			   (!discover && !enroll && !only_slave);
+			   fwpkg || (!discover && !enroll && !only_slave);
 	if (need_target) {
 		if (dst_addr < 0) {
 			uint8_t fa = 0, fe = 0;
@@ -1193,6 +1209,9 @@ int main(int argc, char **argv)
 			run_soak(&ctx, (uint8_t)dst_eid, soak, timeout, &r);
 		} else if (pectest) {
 			run_pec_test(&ctx, (uint8_t)dst_eid, timeout, &r);
+		} else if (fwpkg) {
+			run_pldm_update(&ctx, (uint8_t)dst_eid, fwpkg, timeout,
+					&r);
 		} else {
 			if (!only_slave)
 				run_master_tests(&ctx, (uint8_t)dst_eid,

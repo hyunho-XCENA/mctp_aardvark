@@ -7,3 +7,6 @@
 # Object / build artifacts
 *.o
 *.obj
+
+# Firmware update packages (test artifacts, not source)
+*.pldm

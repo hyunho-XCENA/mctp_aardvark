@@ -43,6 +43,7 @@
 // libpldm (pldm_test.c), to avoid clashing with libpldm's own definitions.
 #define MCTP_MSG_TYPE_PLDM 0x01
 #define PLDM_RQ		   0x80 // request bit in PLDM hdr byte 0
+#define PLDM_TYPE_FWUP	   0x05 // PLDM type field for Firmware Update (DSP0267)
 
 struct app_ctx {
 	Aardvark aa;
@@ -70,6 +71,10 @@ struct app_ctx {
 
 	// live-listen accounting
 	int req_seen;
+
+	// active firmware-update session (FD-initiated transfer phase); when
+	// non-NULL, incoming PLDM FW-update requests route to fwup_handle_request
+	void *fwup;
 
 	// last physical TX status (for fast scan: skip wait on SLA_NACK)
 	int last_tx_status;
@@ -126,6 +131,20 @@ void run_pldm_event_bench(struct app_ctx *ctx, uint8_t dst_eid, int timeout_ms,
 // reassembled record matches a single-shot read.
 void run_pldm_multipart_bench(struct app_ctx *ctx, uint8_t dst_eid,
 			      int timeout_ms, struct results *r);
+
+// ---- PLDM firmware update (Update Agent), implemented in pldm_update_test.c.
+// Runs the full DSP0267 update of a PLDM package against the DUT (Firmware
+// Device): RequestUpdate/PassComponentTable/UpdateComponent, serves the
+// FD-initiated RequestFirmwareData/TransferComplete/VerifyComplete/
+// ApplyComplete, then ActivateFirmware. WARNING: this writes firmware.
+int run_pldm_update(struct app_ctx *ctx, uint8_t dst_eid, const char *pkg_path,
+		    int timeout_ms, struct results *r);
+// Respond to an FD-initiated PLDM firmware-update request (used during the
+// transfer phase). Routed from rx_all when ctx->fwup is active.
+void fwup_handle_request(struct app_ctx *ctx, uint8_t src_eid, uint8_t msg_tag,
+			 const uint8_t *m, size_t len);
+// Pump the MCTP rx/tx machinery once (used to drive the FD-initiated phase).
+void mctp_pump(struct app_ctx *ctx, int timeout_ms);
 
 // ---- PLDM Firmware Update validator (implemented in pldm_fwup_test.c) ----
 // Read-only: acts as Update Agent and queries the DUT (Firmware Device) with
