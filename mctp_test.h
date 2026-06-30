@@ -50,6 +50,7 @@ struct app_ctx {
 	struct mctp_binding_i2c *i2c;
 	int verbose;
 	int pec;	  // append/verify SMBus PEC (CRC-8) byte
+	int corrupt_pec;  // if set, flip the appended PEC byte (PEC-enforcement test)
 	uint8_t own_addr; // our 7-bit slave address
 	uint8_t own_eid;
 	uint8_t inst_id;  // control message instance id, auto-increment

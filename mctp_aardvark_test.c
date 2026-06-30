@@ -111,6 +111,8 @@ static int aa_tx(const void *buf, size_t len, void *vctx)
 		pecbuf[0] = (uint8_t)(dst7 << 1); // write address
 		memcpy(pecbuf + 1, out, outlen);
 		out[outlen] = crc8_smbus(pecbuf, outlen + 1);
+		if (ctx->corrupt_pec)
+			out[outlen] ^= 0xff; // bad PEC, for the enforcement test
 		outlen++;
 	}
 
@@ -431,6 +433,54 @@ static void run_soak(struct app_ctx *ctx, uint8_t dst_eid, int count,
 	       (unsigned long long)wall);
 	check(r, "SOAK no drops", fail_n == 0, "%d ok, %d dropped of %d", ok_n,
 	      fail_n, count);
+}
+
+// ===================================================================
+// PEC enforcement test.
+//
+// PEC is optional at the MCTP layer in the abstract — OpenBMC's libmctp i2c
+// binding appends no PEC of its own, leaving it to the kernel SMBus layer. So
+// whether PEC enforcement is REQUIRED depends on the deployment. In an
+// environment where every sender attaches a PEC (this harness runs with -C and
+// the DUT appends PEC to all of its responses), a frame that arrives with a
+// BAD PEC is corrupt and the receiver MUST reject it — accepting it means the
+// device acted on corrupted data. Under that guarantee this is a real pass/
+// fail. Sequence: good (baseline) -> corrupted PEC (must be dropped, no
+// response) -> good (recovery, DUT not left wedged). Requires -C.
+// ===================================================================
+static void run_pec_test(struct app_ctx *ctx, uint8_t dst_eid, int timeout_ms,
+			 struct results *r)
+{
+	printf("\n== PEC enforcement test (EID %u) ==\n", dst_eid);
+	printf("   (assumes a PEC-everywhere environment: all senders append a "
+	       "PEC, so a bad PEC = corrupt frame the DUT must reject)\n");
+	if (!ctx->pec) {
+		check(r, "PEC test needs -C", false,
+		      "run with -C so a PEC byte is appended");
+		return;
+	}
+
+	// 1. Baseline with a correct PEC.
+	bool good = master_request(ctx, dst_eid, MCTP_CTRL_CMD_GET_EID, NULL, 0,
+				   timeout_ms);
+	check(r, "baseline good-PEC request", good,
+	      good ? "answered" : "no response");
+
+	// 2. Corrupted PEC: the DUT must discard the frame (no response). A
+	//    response means it accepted a corrupt frame.
+	ctx->corrupt_pec = 1;
+	bool bad = master_request(ctx, dst_eid, MCTP_CTRL_CMD_GET_EID, NULL, 0,
+				  timeout_ms);
+	ctx->corrupt_pec = 0;
+	check(r, "bad-PEC frame rejected", !bad,
+	      bad ? "DUT ANSWERED a bad-PEC frame (accepted corrupt data)" :
+		    "no response (frame dropped, as required)");
+
+	// 3. Recovery: a correct PEC works again (DUT not left wedged).
+	bool recover = master_request(ctx, dst_eid, MCTP_CTRL_CMD_GET_EID, NULL,
+				      0, timeout_ms);
+	check(r, "recovery after bad-PEC frame", recover,
+	      recover ? "answered" : "no response (DUT stuck?)");
 }
 
 // ===================================================================
@@ -945,6 +995,7 @@ static void usage(const char *prog)
 		"  -V        PLDM event poll (PollForPlatformEventMessage 0x0b)\n"
 		"  -M        PLDM multipart GetPDR transfer + reassembly check\n"
 		"  -B N      soak: N Get-Endpoint-ID round-trips, report drops + latency\n"
+		"  -Y        PEC enforcement: DUT must drop a request with a bad SMBus PEC (needs -C)\n"
 		"  -D id:st  drive state effecter <id> to state <st> (e.g. -D 5:2; changes DUT)\n"
 		"  -L secs   also LIVE-listen for DUT requests\n"
 		"  -i        interactive shell (no validator)\n"
@@ -962,11 +1013,11 @@ int main(int argc, char **argv)
 	int discover = 0, scan = 0, assign_eid = 0, pldm = 0;
 	int platform = 0, allow_writes = 0, enroll = 0, fwup = 0, negative = 0;
 	int drive = 0, drive_eff = 0, drive_state = 0;
-	int event = 0, multipart = 0, soak = 0;
+	int event = 0, multipart = 0, soak = 0, pectest = 0;
 	int opt;
 
 	while ((opt = getopt(argc, argv,
-			     "p:b:s:e:d:E:t:L:x:D:B:CuPmSARGTWOUNVMivh")) != -1) {
+			     "p:b:s:e:d:E:t:L:x:D:B:CuPmSARGTWOUNVMYivh")) != -1) {
 		switch (opt) {
 		case 'p': port = (int)strtol(optarg, NULL, 0); break;
 		case 'b': bitrate = (int)strtol(optarg, NULL, 0); break;
@@ -993,6 +1044,7 @@ int main(int argc, char **argv)
 		case 'V': event = 1; break;
 		case 'M': multipart = 1; break;
 		case 'B': soak = (int)strtol(optarg, NULL, 0); break;
+		case 'Y': pectest = 1; break;
 		case 'D': {
 			// -D id:state  (decimal or 0x.. hex), e.g. -D 5:2
 			char *colon = strchr(optarg, ':');
@@ -1072,7 +1124,7 @@ int main(int argc, char **argv)
 	// Enrollment does its own NULL-EID probing (and scans the whole bus
 	// when no -d is given), so it resolves its own targets.
 	bool need_target = interactive || pldm || platform || drive || fwup ||
-			   negative || event || multipart || soak > 0 ||
+			   negative || event || multipart || soak > 0 || pectest ||
 			   (!discover && !enroll && !only_slave);
 	if (need_target) {
 		if (dst_addr < 0) {
@@ -1139,6 +1191,8 @@ int main(int argc, char **argv)
 						 &r);
 		} else if (soak > 0) {
 			run_soak(&ctx, (uint8_t)dst_eid, soak, timeout, &r);
+		} else if (pectest) {
+			run_pec_test(&ctx, (uint8_t)dst_eid, timeout, &r);
 		} else {
 			if (!only_slave)
 				run_master_tests(&ctx, (uint8_t)dst_eid,

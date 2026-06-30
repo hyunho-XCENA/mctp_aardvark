@@ -109,6 +109,7 @@ sudo udevadm control --reload && sudo udevadm trigger   # 후 장치 재연결
 ./run_mctp_test.sh -V -C         # PLDM 이벤트 폴링 (PollForPlatformEventMessage 0x0b)
 ./run_mctp_test.sh -M -C         # GetPDR multipart 전송 + 재조립 검증
 ./run_mctp_test.sh -B 200 -C     # soak: 200회 왕복, 드롭률·레이턴시 측정
+./run_mctp_test.sh -Y -C         # PEC 강제: 틀린 PEC 프레임을 DUT가 거부하는지
 ./run_mctp_test.sh -D 7:2 -C     # state effecter 7를 state 2로 능동 변경 (예: LED on) — before/after 확인
 ./run_mctp_test.sh -C -i         # 대화형 셸 (g / ver / types / q)
 ./run_mctp_test.sh -C -v         # 와이어 덤프 + libmctp 디버그 로그
@@ -134,6 +135,7 @@ sudo udevadm control --reload && sudo udevadm trigger   # 후 장치 재연결
 | **EVENT** (`-V`) | PollForPlatformEventMessage(0x0b)로 DUT의 큐된 플랫폼 이벤트를 폴링(event_id 0=없음). GetFirstPart로 읽고 ack는 안 함(상태 보존) | ✅ 실제 버스 |
 | **MULTIPART** (`-M`) | GetPDR을 작은 requestCount로 요청해 단일 레코드의 멀티파트 전송(GetFirstPart/GetNextPart)을 강제하고, 재조립 결과를 단발 읽기와 비교. DUT가 requestCount를 무시하고 통째로 주면 그 사실을 note로 출력(무결성은 검증) | ✅ 실제 버스 |
 | **SOAK** (`-B N`) | Get Endpoint ID를 N회 반복 왕복해 드롭 수 + min/avg/max 레이턴시 측정. 버스 안정성 확인 | ✅ 실제 버스 |
+| **PEC enforcement** (`-Y`) | 일부러 **틀린 SMBus PEC**로 요청을 보내 DUT가 프레임을 드롭하는지 검증(good→bad→good 순). **모든 송신자가 PEC를 붙이는 환경 가정** — 그 환경에선 bad PEC = 손상 프레임이라 수신측이 반드시 거부해야 함(응답하면 FAIL). 일반적으론 PEC가 optional(libmctp i2c는 PEC를 안 붙임)이므로 이 검사는 PEC-everywhere 배포에 한함. `-C` 필요 | ✅ 실제 버스 |
 | **INTERACTIVE** (`-i`) | 수동으로 컨트롤 명령 송신 + 들어오는 요청 자동 응답 | ✅ 실제 버스 |
 | **LIVE** (`-L secs`) | DUT가 우리에게 보내는 요청을 일정 시간 관찰 | ✅ 실제 버스 |
 
@@ -167,6 +169,7 @@ sudo udevadm control --reload && sudo udevadm trigger   # 후 장치 재연결
 | `-V` | PLDM 이벤트 폴링 (PollForPlatformEventMessage) | - |
 | `-M` | GetPDR multipart 전송 + 재조립 검증 | - |
 | `-B N` | soak: N회 왕복 드롭률·레이턴시 측정 | - |
+| `-Y` | PEC 강제 검증 (틀린 PEC 프레임 거부 여부, `-C` 필요) | - |
 | `-D id:st` | state effecter `id`를 state `st`로 능동 변경 (DUT 상태 변경, 예: LED) | - |
 | `-L secs` | LIVE 리스닝 | - |
 | `-i` | 대화형 셸 | - |
