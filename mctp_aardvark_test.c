@@ -671,6 +671,7 @@ static void run_discovery(struct app_ctx *ctx, uint8_t peer_addr, int scan,
 			found++;
 	}
 	printf("\nDiscovered %d endpoint(s).\n", found);
+	check(r, "discovery found endpoint(s)", found > 0, "%d found", found);
 }
 
 // ===================================================================
@@ -929,6 +930,8 @@ static void run_openbmc_enroll(struct app_ctx *ctx, int peer_addr,
 		printf("  0x%02x  0x%02x  %-6s/%-7s %-20s %s\n", e->eid, e->phys,
 		       kind, eidtype, tbuf, ub);
 	}
+	check(r, "enrollment: endpoint(s) found", tbl.n > 0, "%d enrolled",
+	      tbl.n);
 }
 
 // ===================================================================

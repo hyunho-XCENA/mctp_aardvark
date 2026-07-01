@@ -20,9 +20,20 @@ declare -a failed_modes
 run() {
 	local name="$1"
 	shift
-	local out sum p f
+	local out rc sum p f why
 	out=$(timeout 180 "$ROOT/run_mctp_test.sh" "$@" $EXTRA -C 2>&1)
+	rc=$?
 	sum=$(echo "$out" | grep -m1 "== SUMMARY ==")
+	# No SUMMARY (or non-zero exit with none) => the mode aborted before
+	# running any checks — almost always because the DUT wasn't found. That
+	# is a failure, not a silent 0/0 (which would falsely read as "pass").
+	if [ -z "$sum" ]; then
+		why=$(echo "$out" | grep -m1 -iE "no endpoint|out of memory|aa_open|failed" || true)
+		printf "%-26s | ERROR — %s\n" "$name" "${why:-did not run (rc=$rc)}"
+		total_fail=$((total_fail + 1))
+		failed_modes+=("$name")
+		return
+	fi
 	p=$(echo "$sum" | sed -n 's/.*== *\([0-9]*\) passed.*/\1/p')
 	f=$(echo "$sum" | sed -n 's/.* \([0-9]*\) failed.*/\1/p')
 	p=${p:-0}
